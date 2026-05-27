@@ -700,10 +700,18 @@ fn init_common(launch_mode: &LaunchMode, timer: Option<&mut IntervalTimer>) -> R
             if crash_recovery::is_crash_recovery_process(launch_mode.args().as_ref()) {
                 zap_ng_logging::init_for_crash_recovery_process()?;
             } else {
-                zap_ng_logging::init(zap_ng_logging::LogConfig { is_cli, log_destination })?;
+                zap_ng_logging::init(zap_ng_logging::LogConfig {
+                    is_cli,
+                    log_destination,
+                    ..Default::default()
+                })?;
             }
         } else {
-            zap_ng_logging::init(zap_ng_logging::LogConfig { is_cli, log_destination })?;
+            zap_ng_logging::init(zap_ng_logging::LogConfig {
+                is_cli,
+                log_destination,
+                ..Default::default()
+            })?;
         }
     }
 
