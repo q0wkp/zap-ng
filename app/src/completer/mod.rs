@@ -46,13 +46,29 @@ pub struct SessionContext {
     command_registry: Arc<CommandRegistry>,
     pub current_working_directory: TypedPathBuf,
 
-    cached_directory_entries: dashmap::DashMap<TypedPathBuf, Arc<Vec<EngineDirEntry>>>,
+    /// Directory listings keyed by absolute path. Callers that must reflect a directory's
+    /// current contents should use `refresh_directory_entries` to re-read from disk.
+    cached_directory_entries: Arc<dashmap::DashMap<TypedPathBuf, Arc<Vec<EngineDirEntry>>>>,
 
     /// Snapshot of all ZapNG workflow aliases.
     workflow_aliases: HashMap<String, String>,
 }
 
 impl SessionContext {
+    /// Lists `directory` fresh from disk and caches the results.
+    pub(crate) async fn refresh_directory_entries(
+        &self,
+        directory: TypedPathBuf,
+    ) -> Arc<Vec<EngineDirEntry>> {
+        let result = Arc::new(
+            self.list_directory_entries_internal(&directory.to_path())
+                .await,
+        );
+        self.cached_directory_entries
+            .insert(directory, result.clone());
+        result
+    }
+
     async fn list_directory_entries_internal(
         &self,
         directory: &TypedPath<'_>,
@@ -340,7 +356,7 @@ impl SessionContext {
             session: session.into(),
             command_registry,
             current_working_directory,
-            cached_directory_entries: Default::default(),
+            cached_directory_entries: Arc::new(Default::default()),
             workflow_aliases,
         }
     }
