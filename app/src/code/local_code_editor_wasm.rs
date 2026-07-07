@@ -7,6 +7,7 @@
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 
 use std::ops::Range;
@@ -37,7 +38,7 @@ pub enum LocalCodeEditorEvent {
     #[allow(dead_code)]
     FileSaved,
     #[allow(dead_code)]
-    FailedToSave { error: Rc<FileSaveError> },
+    FailedToSave { error: Arc<FileSaveError> },
     #[allow(dead_code)]
     DiffAccepted,
     #[allow(dead_code)]

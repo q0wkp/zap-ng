@@ -23,7 +23,7 @@ use crate::code::editor::{
     scroll::{ScrollPosition, ScrollTrigger, ScrollWheelBehavior},
 };
 use crate::code::{
-    editor::EditorReviewComment, DiffResult, NoopCommentEditorProvider, ShowCommentEditorProvider,
+    editor::EditorReviewComment, NoopCommentEditorProvider, ShowCommentEditorProvider,
 };
 use crate::{
     appearance::Appearance,
@@ -39,7 +39,6 @@ use lazy_static::lazy_static;
 use num_traits::SaturatingSub;
 use pathfinder_geometry::vector::vec2f;
 use std::fmt::Debug;
-use std::rc::Rc;
 use std::{collections::HashMap, ops::Range};
 use std::{collections::HashSet, path::Path};
 use string_offset::CharOffset;
@@ -109,7 +108,8 @@ pub enum CodeEditorEvent {
     ContentChanged {
         origin: EditOrigin,
     },
-    UnifiedDiffComputed(Rc<DiffResult>),
+    /// Emitted when a unified diff computation completes.
+    UnifiedDiffComputed,
     SelectionChanged,
     SelectionStart,
     SelectionEnd,
@@ -1205,8 +1205,8 @@ impl CodeEditorView {
                 }
                 ctx.emit(CodeEditorEvent::ContentChanged { origin: *origin });
             }
-            CodeEditorModelEvent::UnifiedDiffComputed(diff) => {
-                ctx.emit(CodeEditorEvent::UnifiedDiffComputed(diff.clone()));
+            CodeEditorModelEvent::UnifiedDiffComputed(_) => {
+                ctx.emit(CodeEditorEvent::UnifiedDiffComputed);
             }
             CodeEditorModelEvent::ViewportUpdated(version) => {
                 if let Some(trigger) = self

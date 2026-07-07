@@ -13,6 +13,7 @@ use std::io;
 use std::ops::Range;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{
     collections::HashMap,
@@ -24,8 +25,10 @@ use remote_server::manager::RemoteServerManager;
 use zap_ng_core::HostId;
 use zap_ng_util::standardized_path::StandardizedPath;
 
+use futures::channel::oneshot;
+use futures::future::BoxFuture;
 use futures::io::{AsyncBufReadExt, BufReader};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 
 use async_channel::Sender;
 use notify_debouncer_full::notify::{RecursiveMode, WatchFilter};
@@ -61,7 +64,7 @@ pub enum FileModelEvent {
     },
     FailedToSave {
         id: FileId,
-        error: Rc<FileSaveError>,
+        error: Arc<FileSaveError>,
     },
     FileUpdated {
         id: FileId,
@@ -70,6 +73,10 @@ pub enum FileModelEvent {
         new_version: ContentVersion,
     },
 }
+
+/// Resolves with the outcome of one dispatched save. The sender is only
+/// dropped on app teardown, in which case the outcome is treated as success.
+pub type SaveFuture = BoxFuture<'static, Result<(), Arc<FileSaveError>>>;
 
 impl FileModelEvent {
     pub fn file_id(&self) -> FileId {
@@ -735,18 +742,22 @@ impl FileModel {
         // Remote files have no watcher to clean up.
     }
 
+    /// Saves the file's content, returning a future that resolves with the
+    /// write outcome. `FileSaved` / `FailedToSave` events are still emitted
+    /// for subscribers; the future is a per-request completion signal.
     pub fn save(
         &mut self,
         file_id: FileId,
         content: String,
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
-    ) -> Result<(), FileSaveError> {
+    ) -> Result<SaveFuture, FileSaveError> {
         let backend = self
             .file_state
             .get(file_id)
             .ok_or(FileSaveError::NoFilePath(file_id))?;
 
+        let (tx, rx) = oneshot::channel();
         match backend {
             FileBackend::Local(_) => {
                 let file_path = self
@@ -769,8 +780,9 @@ impl FileModel {
                         })
                     },
                     move |me, write_result: Result<(), FileSaveError>, ctx| {
-                        match write_result {
-                            Ok(_) => {
+                        let result = write_result.map_err(Arc::new);
+                        match &result {
+                            Ok(()) => {
                                 me.set_version(file_id, version);
                                 ctx.emit(FileModelEvent::FileSaved {
                                     id: file_id,
@@ -779,9 +791,10 @@ impl FileModel {
                             }
                             Err(err) => ctx.emit(FileModelEvent::FailedToSave {
                                 id: file_id,
-                                error: Rc::new(err),
+                                error: err.clone(),
                             }),
                         };
+                        let _ = tx.send(result);
                     },
                 );
             }
@@ -796,26 +809,31 @@ impl FileModel {
                 };
                 ctx.spawn(
                     future,
-                    move |me, result: Result<(), String>, ctx| match result {
-                        Ok(()) => {
-                            me.set_version(file_id, version);
-                            ctx.emit(FileModelEvent::FileSaved {
-                                id: file_id,
-                                version,
-                            });
+                    move |me, result: Result<(), String>, ctx| {
+                        let result =
+                            result.map_err(|e| Arc::new(FileSaveError::RemoteError(e)));
+                        match &result {
+                            Ok(()) => {
+                                me.set_version(file_id, version);
+                                ctx.emit(FileModelEvent::FileSaved {
+                                    id: file_id,
+                                    version,
+                                });
+                            }
+                            Err(err) => {
+                                ctx.emit(FileModelEvent::FailedToSave {
+                                    id: file_id,
+                                    error: err.clone(),
+                                });
+                            }
                         }
-                        Err(err) => {
-                            ctx.emit(FileModelEvent::FailedToSave {
-                                id: file_id,
-                                error: Rc::new(FileSaveError::RemoteError(err)),
-                            });
-                        }
+                        let _ = tx.send(result);
                     },
                 );
             }
         }
 
-        Ok(())
+        Ok(async move { rx.await.unwrap_or(Ok(())) }.boxed())
     }
 
     /// Renames a file and also saves its content.
@@ -877,7 +895,7 @@ impl FileModel {
                     }
                     Err(err) => ctx.emit(FileModelEvent::FailedToSave {
                         id: file_id,
-                        error: Rc::new(err),
+                        error: Arc::new(err),
                     }),
                 };
             },
@@ -930,7 +948,7 @@ impl FileModel {
                             }
                             Err(err) => ctx.emit(FileModelEvent::FailedToSave {
                                 id: file_id,
-                                error: Rc::new(err),
+                                error: Arc::new(err),
                             }),
                         };
                     },
@@ -954,7 +972,7 @@ impl FileModel {
                         Err(err) => {
                             ctx.emit(FileModelEvent::FailedToSave {
                                 id: file_id,
-                                error: Rc::new(FileSaveError::RemoteError(err)),
+                                error: Arc::new(FileSaveError::RemoteError(err)),
                             });
                         }
                     },

@@ -98,6 +98,8 @@ use crate::ai::blocklist::usage::conversation_usage_view::{
     ConversationUsageInfo, ConversationUsageView, DisplayMode, TimingInfo,
 };
 use crate::ai::blocklist::{block_context_from_terminal_model, SlashCommandRequest};
+use crate::ai::blocklist::diff_storage::DiffStorageHelper;
+use crate::ai::blocklist::diff_types::FileDiff;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel, AIDocumentVersion};
 use crate::ai::loading::shimmering_zap_ng_loading_text;
 #[cfg(feature = "local_fs")]
@@ -206,7 +208,7 @@ use crate::ai::{
     blocklist::{
         ai_brand_color, get_ai_block_overflow_menu_element_position_id,
         get_attached_blocks_chip_element_position_id,
-        inline_action::code_diff_view::{CodeDiffView, FileDiff},
+        inline_action::code_diff_view::CodeDiffView,
         summarization_cancel_dialog::SummarizationCancelDialog,
         telemetry_banner::should_collect_ai_ugc_telemetry,
         AIBlock, AIBlockEvent, BlocklistAIActionEvent, BlocklistAIActionModel,
@@ -13037,11 +13039,15 @@ impl TerminalView {
         ctx.subscribe_to_view(&diff_view, move |me, view, event, ctx| {
             match event {
                 CodeDiffViewEvent::TryAccept => {
-                    view.update(ctx, |diff_view, ctx| {
-                        diff_view.accept_and_save(ctx);
+                    // Persist the accepted (possibly edited) passive suggestion
+                    // through the shared DiffStorageHelper flow. The result
+                    // isn't surfaced to the LLM on this path; failed writes
+                    // surface per-file toasts from the view's save
+                    // subscriptions.
+                    let _save_future = view.update(ctx, |diff_view, ctx| {
+                        diff_view.send_malformed_line_telemetry(ctx);
+                        DiffStorageHelper::accept_and_save(diff_view, ctx)
                     });
-                }
-                CodeDiffViewEvent::SavedAcceptedDiffs { .. } => {
                     ctx.notify();
                 }
                 CodeDiffViewEvent::CancelPassive => {

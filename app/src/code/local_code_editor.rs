@@ -16,6 +16,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 
 use pathfinder_geometry::vector::Vector2F;
@@ -97,7 +98,7 @@ pub enum LocalCodeEditorEvent {
     },
     FileSaved,
     FailedToSave {
-        error: Rc<FileSaveError>,
+        error: Arc<FileSaveError>,
     },
     DiffAccepted,
     DiffRejected,
@@ -207,7 +208,7 @@ impl LocalCodeEditorView {
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         ctx.subscribe_to_view(&editor, |me, _, event, ctx| match event {
-            CodeEditorEvent::UnifiedDiffComputed(_) => {
+            CodeEditorEvent::UnifiedDiffComputed => {
                 ctx.emit(LocalCodeEditorEvent::DiffAccepted);
             }
             CodeEditorEvent::ContentChanged { origin, .. } => {
@@ -339,7 +340,7 @@ impl LocalCodeEditorView {
         if let Err(err) = result {
             log::error!("Failed to save file: {err:?}");
             ctx.emit(LocalCodeEditorEvent::FailedToSave {
-                error: Rc::new(err),
+                error: Arc::new(err),
             });
         }
     }
@@ -678,7 +679,7 @@ impl LocalCodeEditorView {
             }) {
             log::error!("Failed to save file to new path: {err:?}");
             ctx.emit(LocalCodeEditorEvent::FailedToSave {
-                error: Rc::new(err),
+                error: Arc::new(err),
             });
             SaveOutcome::Failed
         } else {
@@ -957,22 +958,6 @@ impl DiffViewer for LocalCodeEditorView {
         self.was_edited
     }
 
-    /// Automatically accept and save this diff. Unlike [`Self::accept_diff`] and [`Self::save_local`], this
-    /// waits for the initial file contents to be loaded.
-    fn accept_and_save_diff(&self, ctx: &mut ViewContext<Self>) {
-        ctx.spawn(self.file_loaded.wait(), move |me, _, ctx| {
-            me.accept_diff(ctx);
-            if let Err(err) = me.save_local(ctx) {
-                log::error!("{err:?}");
-                if let ImmediateSaveError::FailedToSave(err) = err {
-                    ctx.emit(LocalCodeEditorEvent::FailedToSave {
-                        error: Rc::new(err),
-                    });
-                }
-            }
-        });
-    }
-
     fn reject_diff(&mut self, ctx: &mut ViewContext<Self>) {
         ctx.emit(LocalCodeEditorEvent::DiffRejected);
     }
@@ -1111,7 +1096,7 @@ impl TypedActionView for LocalCodeEditorView {
                 if let Err(ImmediateSaveError::FailedToSave(err)) = self.save_local(ctx) {
                     log::error!("Failed to save file {err:?}");
                     ctx.emit(LocalCodeEditorEvent::FailedToSave {
-                        error: Rc::new(err),
+                        error: Arc::new(err),
                     });
                 };
             }
