@@ -836,7 +836,8 @@ impl FileModel {
         Ok(async move { rx.await.unwrap_or(Ok(())) }.boxed())
     }
 
-    /// Renames a file and also saves its content.
+    /// Renames a file and also saves its content, returning a future that
+    /// resolves with the write outcome.
     // TODO: refactor this against [`FileModel::save`].
     pub fn rename_and_save(
         &mut self,
@@ -845,11 +846,12 @@ impl FileModel {
         content: String,
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
-    ) -> Result<(), FileSaveError> {
+    ) -> Result<SaveFuture, FileSaveError> {
         let file_path = self
             .file_path(file_id)
             .ok_or(FileSaveError::NoFilePath(file_id))?;
 
+        let (tx, rx) = oneshot::channel();
         ctx.spawn(
             async move {
                 // Make sure the file we're renaming exists.
@@ -885,8 +887,9 @@ impl FileModel {
                     })
             },
             move |me, write_result: Result<(), FileSaveError>, ctx| {
-                match write_result {
-                    Ok(_) => {
+                let result = write_result.map_err(Arc::new);
+                match &result {
+                    Ok(()) => {
                         me.set_version(file_id, version);
                         ctx.emit(FileModelEvent::FileSaved {
                             id: file_id,
@@ -895,27 +898,30 @@ impl FileModel {
                     }
                     Err(err) => ctx.emit(FileModelEvent::FailedToSave {
                         id: file_id,
-                        error: Arc::new(err),
+                        error: err.clone(),
                     }),
                 };
+                let _ = tx.send(result);
             },
         );
 
-        Ok(())
+        Ok(async move { rx.await.unwrap_or(Ok(())) }.boxed())
     }
 
-    /// Deletes the specified file.
+    /// Deletes the specified file, returning a future that resolves with the
+    /// delete outcome.
     pub fn delete(
         &mut self,
         file_id: FileId,
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
-    ) -> Result<(), FileSaveError> {
+    ) -> Result<SaveFuture, FileSaveError> {
         let backend = self
             .file_state
             .get(file_id)
             .ok_or(FileSaveError::NoFilePath(file_id))?;
 
+        let (tx, rx) = oneshot::channel();
         match backend {
             FileBackend::Local(_) => {
                 let file_path = self
@@ -938,8 +944,9 @@ impl FileModel {
                         })
                     },
                     move |me, delete_result: Result<(), FileSaveError>, ctx| {
-                        match delete_result {
-                            Ok(_) => {
+                        let result = delete_result.map_err(Arc::new);
+                        match &result {
+                            Ok(()) => {
                                 me.set_version(file_id, version);
                                 ctx.emit(FileModelEvent::FileSaved {
                                     id: file_id,
@@ -948,9 +955,10 @@ impl FileModel {
                             }
                             Err(err) => ctx.emit(FileModelEvent::FailedToSave {
                                 id: file_id,
-                                error: Arc::new(err),
+                                error: err.clone(),
                             }),
                         };
+                        let _ = tx.send(result);
                     },
                 );
             }
@@ -961,26 +969,31 @@ impl FileModel {
                     async move { client.delete_file(path).await.map_err(|e| e.to_string()) };
                 ctx.spawn(
                     future,
-                    move |me, result: Result<(), String>, ctx| match result {
-                        Ok(()) => {
-                            me.set_version(file_id, version);
-                            ctx.emit(FileModelEvent::FileSaved {
-                                id: file_id,
-                                version,
-                            });
+                    move |me, result: Result<(), String>, ctx| {
+                        let result =
+                            result.map_err(|e| Arc::new(FileSaveError::RemoteError(e)));
+                        match &result {
+                            Ok(()) => {
+                                me.set_version(file_id, version);
+                                ctx.emit(FileModelEvent::FileSaved {
+                                    id: file_id,
+                                    version,
+                                });
+                            }
+                            Err(err) => {
+                                ctx.emit(FileModelEvent::FailedToSave {
+                                    id: file_id,
+                                    error: err.clone(),
+                                });
+                            }
                         }
-                        Err(err) => {
-                            ctx.emit(FileModelEvent::FailedToSave {
-                                id: file_id,
-                                error: Arc::new(FileSaveError::RemoteError(err)),
-                            });
-                        }
+                        let _ = tx.send(result);
                     },
                 );
             }
         }
 
-        Ok(())
+        Ok(async move { rx.await.unwrap_or(Ok(())) }.boxed())
     }
 
     /// Look up the `RemoteServerClient` for a given host at call time.
