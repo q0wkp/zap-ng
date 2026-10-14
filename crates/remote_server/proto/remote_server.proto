@@ -34,6 +34,7 @@ message ClientMessage {
     ReadFileChunk read_file_chunk = 21;
     WriteFileChunk write_file_chunk = 22;
     ReadImageThumbnail read_image_thumbnail = 23;
+    RenameFile rename_file = 24;
   }
 }
 // Top-level envelope for all server → client messages.
@@ -62,6 +63,7 @@ message ServerMessage {
     ReadFileChunkResponse read_file_chunk_response = 21;
     WriteFileChunkResponse write_file_chunk_response = 22;
     ReadImageThumbnailResponse read_image_thumbnail_response = 23;
+    RenameFileResponse rename_file_response = 24;
   }
 }
 
@@ -250,6 +252,21 @@ message WriteFileResponse {
 }
 
 message WriteFileSuccess {}
+
+message RenameFile {
+  string path = 1;
+  string new_path = 2;
+  string content = 3;
+}
+
+message RenameFileResponse {
+  oneof result {
+    RenameFileSuccess success = 1;
+    FileOperationError error = 2;
+  }
+}
+
+message RenameFileSuccess {}
 
 // Client → server: delete a file.
 message DeleteFile {

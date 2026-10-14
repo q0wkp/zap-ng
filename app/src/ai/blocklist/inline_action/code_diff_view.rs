@@ -7,7 +7,8 @@
 use crate::ai::blocklist::view_util::render_provider_icon_button;
 use crate::ai::skills::{SkillOpenOrigin, SkillTelemetryEvent};
 use anyhow::Result;
-use futures::future::BoxFuture;
+use futures::channel::oneshot;
+use futures::future::{join_all, BoxFuture};
 use futures::FutureExt;
 use lazy_static::lazy_static;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
@@ -36,6 +37,7 @@ use zap_ng_core::{
 use zap_ng_editor::{
     content::buffer::InitialBufferState, render::element::VerticalExpansionBehavior,
 };
+use zap_ng_util::file::FileSaveError;
 use zap_ng_util::path::common_path;
 use zap_ng_util::standardized_path::StandardizedPath;
 use zap_ng_ui::{
@@ -437,6 +439,7 @@ pub struct CodeDiffView {
     diff_session_type: DiffSessionType,
     /// Number of dispatched saves still in flight; guards revert while saving.
     pending_saves: usize,
+    revert_in_progress: bool,
 }
 
 impl CodeDiffView {
@@ -567,6 +570,9 @@ impl CodeDiffView {
             }
             #[cfg(not(target_family = "wasm"))]
             InlineDiffViewEvent::FailedToSave { error } => {
+                if me.revert_in_progress {
+                    return;
+                }
                 crate::safe_error!(
                     safe: ("Failed to save file for accepted AgentMode diffs"),
                     full: ("Failed to save file for accepted AgentMode diffs for {}: {}", file_path_clone, error)
@@ -865,6 +871,7 @@ impl CodeDiffView {
             session_platform,
             diff_session_type: DiffSessionType::Local,
             pending_saves: 0,
+            revert_in_progress: false,
         }
     }
 
@@ -1050,40 +1057,72 @@ impl CodeDiffView {
 
     /// Revert all changes by replacing file contents with the base version.
     /// For newly created files, this deletes them instead.
-    fn revert_changes(&mut self, ctx: &mut ViewContext<Self>) {
-        if !matches!(self.state, CodeDiffState::Accepted) || self.pending_saves > 0 {
-            log::warn!(
-                "Attempted to revert changes when not in a settled Accepted state - actual state: {:?}",
-                self.state
-            );
-            return;
+    fn revert_changes(&mut self, ctx: &mut ViewContext<Self>) -> Option<SaveFuture> {
+        if !matches!(self.state, CodeDiffState::Accepted)
+            || self.pending_saves > 0
+            || self.revert_in_progress
+        {
+            return None;
         }
-
-        let window_id = ctx.window_id();
-        for diff in &self.pending_diffs {
-            if let Err(err) = diff
-                .diff_view
-                .update(ctx, |v, ctx| v.restore_diff_base(ctx))
-            {
-                log::error!("Failed to restore diff base: {err:?}");
+        let restores = self
+            .pending_diffs
+            .iter()
+            .map(|diff| {
                 let file_name = diff
                     .diff_view
                     .as_ref(ctx)
                     .file_name()
-                    .unwrap_or_else(|| "file".to_string());
-                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
-                    toast_stack.add_ephemeral_toast(
-                        DismissibleToast::error(format!("Failed to revert changes to {file_name}")),
-                        window_id,
-                        ctx,
-                    );
-                });
+                    .unwrap_or_else(|| "file".to_owned());
+                let restore = diff
+                    .diff_view
+                    .update(ctx, |view, ctx| view.restore_and_save_diff(ctx))
+                    .unwrap_or_else(|error| {
+                        futures::future::ready(Err(Arc::new(FileSaveError::Other(error)))).boxed()
+                    });
+                async move { (file_name, restore.await) }
+            })
+            .collect::<Vec<_>>();
+        self.revert_in_progress = true;
+        let (tx, rx) = oneshot::channel();
+        let window_id = ctx.window_id();
+        ctx.spawn(
+            async move { join_all(restores).await },
+            move |me, outcomes, ctx| {
+                me.revert_in_progress = false;
+                let mut result = Ok(());
+                for (file_name, outcome) in outcomes {
+                    if let Err(error) = &outcome {
+                        log::error!("Failed to revert file edits: {error}");
+                        ToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                            stack.add_ephemeral_toast(
+                                DismissibleToast::error(format!(
+                                    "Failed to revert changes to {file_name}"
+                                )),
+                                window_id,
+                                ctx,
+                            );
+                        });
+                    }
+                    result = result.and(outcome);
+                }
+                if result.is_ok() {
+                    me.state = CodeDiffState::Reverted;
+                    me.mark_action_as_reverted(ctx);
+                }
+                ctx.notify();
+                let _ = tx.send(result);
+            },
+        );
+        Some(
+            async move {
+                rx.await.unwrap_or_else(|_| {
+                    Err(Arc::new(FileSaveError::Other(
+                        "Revert completion was cancelled".to_owned(),
+                    )))
+                })
             }
-        }
-
-        self.state = CodeDiffState::Reverted;
-        self.mark_action_as_reverted(ctx);
-        ctx.notify();
+            .boxed(),
+        )
     }
 
     fn mark_action_as_reverted(&self, ctx: &mut ViewContext<Self>) {
@@ -2942,8 +2981,13 @@ impl DiffStorage for CodeDiffView {
                     ..
                 }) = diff_view.diff()
                 {
-                    deleted_paths.push(report_path.clone());
-                    report_path = rename.to_string_lossy().to_string();
+                    let target = StandardizedPath::try_new(&rename.to_string_lossy())
+                        .map(|target| target.to_string())
+                        .unwrap_or_else(|_| rename.to_string_lossy().to_string());
+                    if target != path {
+                        deleted_paths.push(report_path.clone());
+                        report_path = target;
+                    }
                 }
 
                 let changed_lines =
@@ -3080,3 +3124,7 @@ fn editor_range_to_file_context_range(range: Range<usize>) -> Range<usize> {
 fn file_context_range_to_editor_range(range: Range<usize>) -> Range<usize> {
     range.start.saturating_sub(1)..range.end.saturating_sub(1)
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "code_diff_persistence_tests.rs"]
+mod persistence_tests;
