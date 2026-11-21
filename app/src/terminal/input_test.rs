@@ -28,7 +28,10 @@ use crate::cloud_object::{
 use crate::pricing::PricingInfoModel;
 use crate::search::files::model::FileSearchModel;
 use crate::server::ids::ClientId;
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext,
+    CLIAgentSessionStatus, CLIAgentSessionsModel,
+};
 use crate::terminal::input::slash_command_model::SlashCommandEntryState;
 use crate::terminal::input::slash_commands::SlashCommandsEvent;
 use crate::zap_ng_managed_paths_watcher::ZapNGManagedPathsWatcher;
@@ -7240,6 +7243,68 @@ fn test_custom_terminal_page_scroll_binding_applies_when_prompt_is_focused() {
                 terminal.scroll_position(),
                 ScrollPosition::FixedAtPosition { .. }
             ));
+        });
+    });
+}
+
+// Helper: open the CLI-agent rich input for the terminal view under test.
+fn open_rich_input_for_terminal(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+    terminal.update(app, |view, ctx| {
+        let view_id = view.view_id();
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.set_session(
+                view_id,
+                CLIAgentSession {
+                    agent: crate::terminal::CLIAgent::Claude,
+                    status: CLIAgentSessionStatus::InProgress,
+                    session_context: CLIAgentSessionContext::default(),
+                    input_state: CLIAgentInputState::Closed,
+                    should_auto_toggle_input: false,
+                    listener: None,
+                    remote_host: None,
+                    plugin_version: None,
+                    draft_text: None,
+                    custom_command_prefix: None,
+                },
+                ctx,
+            );
+        });
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.open_input(
+                view_id,
+                CLIAgentInputEntrypoint::CtrlG,
+                crate::ai::blocklist::InputConfig {
+                    input_type: crate::ai::blocklist::InputType::AI,
+                    is_locked: true,
+                },
+                false,
+                false,
+                ctx,
+            );
+        });
+    });
+}
+
+#[test]
+fn cli_agent_rich_input_takes_images_whatever_the_agent_model() {
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let _image_flag = FeatureFlag::ImageAsContext.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+        let editor = input.read(&app, |input, _| input.editor().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        // Images in the rich input are pasted into the CLI agent, so whether the Agent Mode
+        // model supports vision doesn't matter.
+        editor.read(&app, |editor, _| {
+            assert!(editor.image_context_options.is_enabled());
+            assert!(!editor.image_context_options.is_unsupported_model());
+            assert_eq!(editor.image_context_options.num_images_in_conversation(), 0);
         });
     });
 }

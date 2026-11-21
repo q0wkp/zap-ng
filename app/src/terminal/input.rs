@@ -2321,6 +2321,9 @@ impl Input {
                 }
             }
 
+            // The rich input takes images whatever the Agent Mode model is.
+            me.update_image_context_options(ctx);
+
             // Set the CLI agent flag after the mode switch so that
             // refresh_categories_state sees the correct is_ai_or_autodetect_mode.
             let is_cli_agent_input = matches!(new_input_state, CLIAgentInputState::Open { .. });
@@ -2870,11 +2873,13 @@ impl Input {
         ctx.subscribe_to_model(&LLMPreferences::handle(ctx), |me, _, event, ctx| {
             if let LLMPreferencesEvent::UpdatedActiveAgentModeLLM = event {
                 // If the new model doesn't support vision and we had image chips,
-                // the context model already cleared them — show a toast.
+                // the context model already cleared them — show a toast. A CLI agent's rich
+                // input keeps its images, since they don't go to that model.
                 let has_image_chips = me
                     .attachment_chips
                     .iter()
-                    .any(|c| matches!(c.attachment_type, AttachmentType::Image));
+                    .any(|c| matches!(c.attachment_type, AttachmentType::Image))
+                    && !CLIAgentSessionsModel::as_ref(ctx).is_input_open(me.terminal_view_id);
                 let vision_supported =
                     LLMPreferences::as_ref(ctx).vision_supported(ctx, Some(me.terminal_view_id));
                 if has_image_chips && !vision_supported {
@@ -4683,9 +4688,18 @@ impl Input {
 
         let vision_supported = llm_prefs.vision_supported(ctx, Some(self.terminal_view_id));
 
+        // A CLI agent's rich input pastes its images into the CLI agent, so neither the Agent
+        // Mode model nor the images in the Agent Mode conversation limit them.
+        let is_cli_agent_input_open =
+            CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id);
+
         let num_images_attached = self.ai_context_model.as_ref(ctx).pending_images().len();
 
-        let conversation = self.ai_context_model.as_ref(ctx).selected_conversation(ctx);
+        let conversation = self
+            .ai_context_model
+            .as_ref(ctx)
+            .selected_conversation(ctx)
+            .filter(|_| !is_cli_agent_input_open);
 
         let num_images_in_conversation = conversation
             .and_then(|conversation| conversation.get_root_task())
@@ -4697,12 +4711,12 @@ impl Input {
             .count();
 
         // Image context is available whenever the feature flag is enabled and we're in AI input
-        // mode, including ambient-agent mode
+        // mode, including ambient-agent mode, or in a CLI agent's rich input
         let image_context_options = if FeatureFlag::ImageAsContext.is_enabled()
-            && matches!(ai_input_model.input_type(), InputType::AI)
+            && (is_cli_agent_input_open || matches!(ai_input_model.input_type(), InputType::AI))
         {
             ImageContextOptions::Enabled {
-                unsupported_model: !vision_supported,
+                unsupported_model: !vision_supported && !is_cli_agent_input_open,
                 is_processing_attached_images: self.is_processing_attached_images,
                 num_images_attached,
                 num_images_in_conversation,
