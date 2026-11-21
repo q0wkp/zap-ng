@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: made the Ollama URL normalizer reusable, added per-profile prompt overrides for titles, a request inspector hook, and secret redaction of outbound requests; renamed the Warp and Zap names to ZapNG; kept the encrypted reasoning of OpenAI Responses across requests.
+// Modified by Tianyu (Sky) Lu in 2026: made the Ollama URL normalizer reusable, added per-profile prompt overrides for titles, a request inspector hook, secret redaction of outbound requests, BYOP auto-compaction against the model's window, and a byte budget for the tool results a request sends; renamed the Warp and Zap names to ZapNG; kept the encrypted reasoning of OpenAI Responses across requests.
 
 //! BYOP 模式下 chat completion + tool calling 适配层(基于 genai 0.5.3)。
 //!
@@ -81,6 +81,7 @@ use ai::agent::convert::ConvertToAPITypeError;
 use super::openai_compatible::OpenAiCompatibleError;
 use super::request_inspector::{self, CallKind, CallOrigin};
 use super::responses_reasoning::{self, ReasoningScope};
+use super::tool_result_budget;
 use super::tools;
 
 // ---------------------------------------------------------------------------
@@ -1847,6 +1848,10 @@ fn build_chat_request(
     // 而 warp 的 `AIAgentInput::ResumeConversation`(handoff/auto-resume after error 等)
     // 不附加新 user 消息,会让序列末尾停在历史 assistant 上。
     // 这里统一兜底:末尾若是 assistant,追加一条隐式 user 消息让上游继续。
+    // Tool results go out within a byte budget, so that one huge output does not push the
+    // request past the window; the conversation keeps them whole.
+    cap_tool_results(&mut messages, &system_text, params);
+
     // A summary request offers no tools (the summary is text alone), and providers that refuse
     // tool calls in a request without tools (Anthropic, Bedrock) would reject the history it
     // summarizes, so that history carries its tool calls and results as text.
@@ -1919,6 +1924,59 @@ fn build_chat_request(
         req = req.with_tools(tools_array);
     }
     Ok(req)
+}
+
+/// Cuts the tool results in `messages` to the budget of [`tool_result_budget`]: at most
+/// [`tool_result_budget::MAX_TOTAL_BYTES`] together, or what the model's input budget leaves
+/// beside the rest of the request when that is less, the newest results first.
+fn cap_tool_results(messages: &mut [ChatMessage], system_text: &str, params: &RequestParams) {
+    let mut sizes = Vec::new();
+    let mut other_bytes = system_text.len();
+    for msg in messages.iter() {
+        for part in msg.content.parts() {
+            match part {
+                ContentPart::ToolResponse(response) => {
+                    sizes.push(tool_result_budget::wire_len(&response.content));
+                }
+                ContentPart::Text(text) | ContentPart::ReasoningContent(text) => {
+                    other_bytes += text.len();
+                }
+                ContentPart::ToolCall(call) => {
+                    other_bytes += call.fn_arguments.to_string().len();
+                }
+                _ => {}
+            }
+        }
+    }
+    if sizes.is_empty() {
+        return;
+    }
+    let room = params.compaction_limit.map(|limit| {
+        let cfg = params.compaction_config.clone().unwrap_or_default();
+        (byop_compaction::overflow::usable(&cfg, limit) * ESTIMATE_BYTES_PER_TOKEN)
+            .saturating_sub(other_bytes)
+    });
+    let total = room.map_or(tool_result_budget::MAX_TOTAL_BYTES, |room| {
+        room.min(tool_result_budget::MAX_TOTAL_BYTES)
+    });
+    let shares = tool_result_budget::allocate(&sizes, total);
+    let mut index = 0;
+    for msg in messages.iter_mut() {
+        for part in msg.content.iter_mut() {
+            if let ContentPart::ToolResponse(response) = part {
+                if let Some(cut) = tool_result_budget::fit(&response.content, shares[index]) {
+                    log::info!(
+                        "[byop] tool result {} cut from {} to {} bytes to fit the budget",
+                        response.call_id,
+                        sizes[index],
+                        tool_result_budget::wire_len(&cut)
+                    );
+                    response.content = cut;
+                }
+                index += 1;
+            }
+        }
+    }
 }
 
 /// `messages` with every tool call and tool result turned into text: a call into a line naming
@@ -8625,5 +8683,144 @@ mod byop_compaction_request_tests {
         ])
         .with_system("z".repeat(1_000));
         assert_eq!(estimate_chat_request_tokens(&req), 2_500);
+    }
+}
+
+#[cfg(test)]
+mod tool_result_budget_request_tests {
+    use super::*;
+
+    fn shell_tool() -> api::message::tool_call::Tool {
+        use api::message::tool_call::run_shell_command::WaitUntilCompleteValue;
+
+        api::message::tool_call::Tool::RunShellCommand(api::message::tool_call::RunShellCommand {
+            command: "docker logs --since 2h app".to_owned(),
+            is_read_only: true,
+            uses_pager: false,
+            is_risky: false,
+            citations: vec![],
+            wait_until_complete_value: Some(WaitUntilCompleteValue::WaitUntilComplete(true)),
+            risk_category: 0,
+        })
+    }
+
+    fn params_with_results(outputs: &[String]) -> RequestParams {
+        let mut messages = vec![make_user_query_message(
+            "task-1",
+            "req-1",
+            "why did it crash?".to_owned(),
+            &[],
+        )];
+        for (i, output) in outputs.iter().enumerate() {
+            let call_id = format!("call-{i}");
+            messages.push(make_tool_call_message(
+                "task-1",
+                "req-1",
+                &call_id,
+                shell_tool(),
+            ));
+            messages.push(make_tool_call_result_message(
+                "task-1",
+                "req-1",
+                call_id,
+                serde_json::json!({
+                    "status": "completed",
+                    "command_id": format!("block-{i}"),
+                    "exit_code": 1,
+                    "output": output,
+                })
+                .to_string(),
+            ));
+        }
+        let task = api::Task {
+            id: "task-1".to_owned(),
+            messages,
+            dependencies: None,
+            description: String::new(),
+            summary: String::new(),
+            server_data: String::new(),
+        };
+        RequestParams::new_for_test(vec![], vec![task])
+    }
+
+    fn results(request: &ChatRequest) -> Vec<(String, String)> {
+        request
+            .messages
+            .iter()
+            .flat_map(|m| m.content.tool_responses())
+            .map(|r| (r.call_id.clone(), r.content.clone()))
+            .collect()
+    }
+
+    fn build(params: &RequestParams) -> ChatRequest {
+        build_chat_request(
+            params,
+            false,
+            AgentProviderApiType::OpenAi,
+            attachment_caps::AttachmentCaps::default(),            None,
+        )
+        .expect("request")
+    }
+
+    #[test]
+    fn a_huge_tool_result_goes_out_cut_and_the_history_keeps_it_whole() {
+        let huge = "container log line\n".repeat(200_000);
+        let params = params_with_results(&[huge.clone()]);
+        let request = build(&params);
+        let results = results(&request);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "call-0");
+        assert!(
+            tool_result_budget::wire_len(&results[0].1) <= tool_result_budget::MAX_RESULT_BYTES
+        );
+        let value: serde_json::Value = serde_json::from_str(&results[0].1).unwrap();
+        assert_eq!(value["exit_code"], 1);
+        assert_eq!(value["command_id"], "block-0");
+        // Only the outbound copy is cut.
+        assert!(params.tasks[0].messages[2].server_message_data.len() > huge.len());
+    }
+
+    #[test]
+    fn all_tool_results_together_stay_within_the_total_budget() {
+        let outputs: Vec<String> = (0..8).map(|i| format!("{i}").repeat(100_000)).collect();
+        let request = build(&params_with_results(&outputs));
+        let results = results(&request);
+        // Every call keeps its result, in order.
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["call-0", "call-1", "call-2", "call-3", "call-4", "call-5", "call-6", "call-7"]
+        );
+        let total: usize = results
+            .iter()
+            .map(|(_, content)| tool_result_budget::wire_len(content))
+            .sum();
+        assert!(
+            total <= tool_result_budget::MAX_TOTAL_BYTES + 8 * tool_result_budget::MIN_RESULT_BYTES,
+            "{total}"
+        );
+        // The newest result got the most room.
+        assert!(
+            tool_result_budget::wire_len(&results[7].1)
+                > tool_result_budget::wire_len(&results[0].1)
+        );
+    }
+
+    #[test]
+    fn a_small_window_tightens_the_budget() {
+        let outputs = vec!["x".repeat(30_000)];
+        let mut params = params_with_results(&outputs);
+        assert_eq!(
+            tool_result_budget::wire_len(&results(&build(&params))[0].1),
+            tool_result_budget::wire_len(&params.tasks[0].messages[2].server_message_data)
+        );
+        params.compaction_limit =
+            byop_compaction::overflow::ModelLimit::for_model(8_000, 1_000, None);
+        let cut = &results(&build(&params))[0].1;
+        assert!(
+            tool_result_budget::wire_len(cut) < 14_000,
+            "{}",
+            tool_result_budget::wire_len(cut)
+        );
     }
 }
