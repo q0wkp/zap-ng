@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: gave each rules file name its own slot, so that CLAUDE.md is kept through indexing, file updates and persistence; renamed the Warp and Zap names to ZapNG.
 
 use anyhow::Result;
 use std::cell::RefCell;
@@ -81,13 +81,22 @@ pub struct ProjectRule {
 #[derive(Debug, Default)]
 struct RuleAtPath {
     parent_path: PathBuf,
-    zap_ng_md: Option<ProjectRule>,
-    agents_md: Option<ProjectRule>,
+    /// The rules files found in `parent_path`: one slot per name in `RULES_FILE_PATTERN`, in
+    /// the same order.
+    slots: [Option<ProjectRule>; RULES_FILE_PATTERN.len()],
 }
 
 impl RuleAtPath {
+    /// The rules file that applies in this directory: the one whose name comes first in
+    /// `RULES_FILE_PATTERN`.
     fn respected_rule(&self) -> Option<&ProjectRule> {
-        self.zap_ng_md.as_ref().or(self.agents_md.as_ref())
+        self.slots.iter().flatten().next()
+    }
+
+    /// Every rules file found in this directory, whether it applies or not.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    fn all_rules(&self) -> impl Iterator<Item = &ProjectRule> {
+        self.slots.iter().flatten()
     }
 }
 
@@ -112,14 +121,19 @@ struct FindRulesResult {
     available_rule_paths: Vec<String>,
 }
 
+/// The slot of `RuleAtPath::slots` a rules file goes in: the index of its name in
+/// `RULES_FILE_PATTERN`, compared without regard to case. `None` for a file that is not a rules
+/// file.
+#[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+fn rule_slot(file_name: &str) -> Option<usize> {
+    RULES_FILE_PATTERN
+        .iter()
+        .position(|pattern| file_name.eq_ignore_ascii_case(pattern))
+}
+
 #[cfg(feature = "local_fs")]
 fn matches_rules_pattern(file_name_str: &str) -> bool {
-    for pattern in RULES_FILE_PATTERN {
-        if file_name_str.to_lowercase() == pattern.to_lowercase() {
-            return true;
-        }
-    }
-    false
+    rule_slot(file_name_str).is_some()
 }
 
 #[derive(Debug, Default)]
@@ -156,19 +170,14 @@ impl ProjectRules {
     fn remove_rule(&mut self, path: &Path) -> Option<ProjectRule> {
         let parent = path.parent()?;
         let file_name = path.file_name().and_then(|name| name.to_str())?;
+        let slot = rule_slot(file_name)?;
 
         let rule = self
             .rules
             .iter_mut()
             .find(|rule| rule.parent_path == parent)?;
 
-        if file_name.to_lowercase() == "warp.md" {
-            rule.zap_ng_md.take()
-        } else if file_name.to_lowercase() == "agents.md" {
-            rule.agents_md.take()
-        } else {
-            None
-        }
+        rule.slots[slot].take()
     }
 
     /// Upsert a rule to the set of project rules. This will create a new RuleAtPath entry if none exists and update the existing one
@@ -179,6 +188,9 @@ impl ProjectRules {
             return;
         };
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let Some(slot) = rule_slot(file_name) else {
             return;
         };
 
@@ -194,25 +206,30 @@ impl ProjectRules {
 
         match existing_rule {
             Some(rule) => {
-                if file_name.to_lowercase() == "warp.md" {
-                    rule.zap_ng_md = rule_file;
-                } else if file_name.to_lowercase() == "agents.md" {
-                    rule.agents_md = rule_file;
-                }
+                rule.slots[slot] = rule_file;
             }
             None => {
                 let mut rule = RuleAtPath {
                     parent_path: parent.to_path_buf(),
                     ..Default::default()
                 };
-                if file_name.to_lowercase() == "warp.md" {
-                    rule.zap_ng_md = rule_file;
-                } else if file_name.to_lowercase() == "agents.md" {
-                    rule.agents_md = rule_file;
-                }
+                rule.slots[slot] = rule_file;
                 self.rules.push(rule);
             }
         };
+    }
+
+    /// Every rules file found under `project_root`, as the paths to persist.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    fn rule_paths(&self, project_root: &Path) -> Vec<ProjectRulePath> {
+        self.rules
+            .iter()
+            .flat_map(|rule| rule.all_rules())
+            .map(|rule| ProjectRulePath {
+                project_root: project_root.to_path_buf(),
+                path: rule.path.clone(),
+            })
+            .collect()
     }
 }
 
@@ -302,22 +319,7 @@ impl ProjectContextModel {
 
                         // Persist the discovered rules.
                         let delta = RulesDelta {
-                            discovered_rules: rule_files
-                                .rules
-                                .iter()
-                                .filter_map(|rule| {
-                                    rule.zap_ng_md.as_ref().map(|rule| ProjectRulePath {
-                                        project_root: root_clone.clone(),
-                                        path: rule.path.clone(),
-                                    })
-                                })
-                                .chain(rule_files.rules.iter().filter_map(|rule| {
-                                    rule.agents_md.as_ref().map(|rule| ProjectRulePath {
-                                        project_root: root_clone.clone(),
-                                        path: rule.path.clone(),
-                                    })
-                                }))
-                                .collect(),
+                            discovered_rules: rule_files.rule_paths(&root_clone),
                             deleted_rules: Default::default(),
                         };
                         ctx.emit(ProjectContextModelEvent::KnownRulesChanged(delta));
@@ -498,7 +500,7 @@ impl ProjectContextModel {
     /// 从 `start` 起逐级向上同步 stat + 读取规则文件。对齐 opencode `findUp`,
     /// 但添加 `MAX_WALK_DEPTH` + `FAST_PATH_BUDGET` 双保障让 UI 绝不阻塞。
     ///
-    /// 每层依 `RULES_FILE_PATTERN`(WARP.md > AGENTS.md)取首个命中的,对齐
+    /// 每层依 `RULES_FILE_PATTERN`(WARP.md > AGENTS.md > CLAUDE.md)取首个命中的,对齐
     /// `RuleAtPath::respected_rule()` 语义。
     #[cfg(feature = "local_fs")]
     fn scan_fast_path(start: &Path) -> FastPathEntry {

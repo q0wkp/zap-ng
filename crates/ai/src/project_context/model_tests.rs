@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: tested that CLAUDE.md is kept through indexing, file updates and persistence; renamed the Warp and Zap names to ZapNG.
 
 use super::*;
 use std::path::PathBuf;
@@ -455,4 +455,151 @@ fn upsert_rule_case_insensitive_filename() {
         .active_rules;
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].path, PathBuf::from("/a/claude.md"));
+}
+
+#[test]
+fn remove_agents_md_lets_claude_md_apply() {
+    // 删掉 AGENTS.md 后，同目录的 CLAUDE.md 接着生效
+    let mut rules = ProjectRules::default();
+    rules.upsert_rule(Path::new("/a/AGENTS.md"), "agents".to_string());
+    rules.upsert_rule(Path::new("/a/CLAUDE.md"), "claude".to_string());
+
+    let removed = rules.remove_rule(Path::new("/a/AGENTS.md"));
+    assert_eq!(removed.map(|rule| rule.content), Some("agents".to_string()));
+
+    let result = rules
+        .find_active_or_applicable_rules(&PathBuf::from("/a/x.rs"))
+        .active_rules;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].path, PathBuf::from("/a/CLAUDE.md"));
+}
+
+#[test]
+fn upsert_rule_replaces_claude_md_content() {
+    let mut rules = ProjectRules::default();
+    rules.upsert_rule(Path::new("/a/CLAUDE.md"), "v1".to_string());
+    rules.upsert_rule(Path::new("/a/CLAUDE.md"), "v2".to_string());
+
+    let result = rules
+        .find_active_or_applicable_rules(&PathBuf::from("/a/x.rs"))
+        .active_rules;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].content, "v2");
+}
+
+#[test]
+fn rule_paths_include_every_rules_file() {
+    // 持久化要记下每个规则文件，包括 CLAUDE.md 和同目录里不生效的那些
+    let mut rules = ProjectRules::default();
+    rules.upsert_rule(Path::new("/a/WARP.md"), "warp".to_string());
+    rules.upsert_rule(Path::new("/a/CLAUDE.md"), "claude".to_string());
+    rules.upsert_rule(Path::new("/a/b/claude.md"), "nested".to_string());
+
+    let mut paths: Vec<PathBuf> = rules
+        .rule_paths(Path::new("/a"))
+        .into_iter()
+        .map(|rule| {
+            assert_eq!(rule.project_root, PathBuf::from("/a"));
+            rule.path
+        })
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            PathBuf::from("/a/CLAUDE.md"),
+            PathBuf::from("/a/WARP.md"),
+            PathBuf::from("/a/b/claude.md"),
+        ]
+    );
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn scan_directory_keeps_claude_md() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("CLAUDE.md"), "claude rules").unwrap();
+
+    let rules =
+        futures::executor::block_on(ProjectContextModel::scan_directory_for_rules(&root)).unwrap();
+
+    let result = rules
+        .find_active_or_applicable_rules(&root.join("src/main.rs"))
+        .active_rules;
+    assert_eq!(result.len(), 1, "完整扫描应保留 CLAUDE.md");
+    assert_eq!(result[0].path, root.join("CLAUDE.md"));
+    assert_eq!(result[0].content, "claude rules");
+
+    let persisted: Vec<PathBuf> = rules
+        .rule_paths(&root)
+        .into_iter()
+        .map(|rule| rule.path)
+        .collect();
+    assert_eq!(persisted, vec![root.join("CLAUDE.md")]);
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn repository_updates_keep_claude_md() {
+    use repo_metadata::TargetFile;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let agents = root.join("AGENTS.md");
+    let claude = root.join("CLAUDE.md");
+    std::fs::write(&agents, "agents").unwrap();
+    std::fs::write(&claude, "claude v1").unwrap();
+
+    let rules =
+        futures::executor::block_on(ProjectContextModel::scan_directory_for_rules(&root)).unwrap();
+    let active = |rules: &ProjectRules| {
+        rules
+            .find_active_or_applicable_rules(&root.join("x.rs"))
+            .active_rules
+    };
+    assert_eq!(active(&rules)[0].path, agents);
+
+    // 删掉 AGENTS.md:同目录的 CLAUDE.md 接着生效
+    std::fs::remove_file(&agents).unwrap();
+    let mut update = RepositoryUpdate::default();
+    update
+        .deleted
+        .insert(TargetFile::new(agents.clone(), false));
+    let (rules, delta) = futures::executor::block_on(
+        ProjectContextModel::process_repository_updates(update, rules, root.clone()),
+    );
+    assert_eq!(delta.deleted_rules, vec![agents.clone()]);
+    let result = active(&rules);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].path, claude);
+    assert_eq!(result[0].content, "claude v1");
+
+    // 修改 CLAUDE.md:新内容生效
+    std::fs::write(&claude, "claude v2").unwrap();
+    let mut update = RepositoryUpdate::default();
+    update
+        .modified
+        .insert(TargetFile::new(claude.clone(), false));
+    let (rules, _) = futures::executor::block_on(ProjectContextModel::process_repository_updates(
+        update,
+        rules,
+        root.clone(),
+    ));
+    let result = active(&rules);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].content, "claude v2");
+
+    // 删掉 CLAUDE.md:不再有规则生效
+    std::fs::remove_file(&claude).unwrap();
+    let mut update = RepositoryUpdate::default();
+    update
+        .deleted
+        .insert(TargetFile::new(claude.clone(), false));
+    let (rules, _) = futures::executor::block_on(ProjectContextModel::process_repository_updates(
+        update,
+        rules,
+        root.clone(),
+    ));
+    assert!(active(&rules).is_empty());
 }
