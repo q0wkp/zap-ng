@@ -168,6 +168,35 @@ fn insert_anthropic_reasoning(
 	Ok(())
 }
 
+/// The smallest thinking budget Anthropic accepts.
+const MIN_THINKING_BUDGET: u32 = 1024;
+
+/// Anthropic rejects (400) a fixed thinking budget (`{type:"enabled", budget_tokens}`) that is not
+/// below `max_tokens`, which a short request (a summary, a title) with a high effort runs into:
+/// the budget is lowered to half of `max_tokens`, or thinking is dropped when that half is under
+/// the smallest budget. Only for requests without tools, where interleaved thinking can't let the
+/// budget exceed `max_tokens`.
+fn fit_thinking_budget_to_max_tokens(payload: &mut Value, max_tokens: u32) {
+	let Some(thinking) = payload.get_mut("thinking").and_then(Value::as_object_mut) else {
+		return;
+	};
+	if thinking.get("type").and_then(Value::as_str) != Some("enabled") {
+		return;
+	}
+	let Some(budget) = thinking.get("budget_tokens").and_then(Value::as_u64) else {
+		return;
+	};
+	if budget < u64::from(max_tokens) {
+		return;
+	}
+	let half = max_tokens / 2;
+	if half >= MIN_THINKING_BUDGET {
+		thinking.insert("budget_tokens".to_string(), json!(half));
+	} else if let Some(payload) = payload.as_object_mut() {
+		payload.remove("thinking");
+	}
+}
+
 // NOTE: For Anthropic, the max_tokens must be specified.
 //       To avoid surprises, the default value for genai is the maximum for a given model.
 // Current logic:
@@ -399,6 +428,9 @@ impl Adapter for AnthropicAdapter {
 
 		let max_tokens = Self::resolve_max_tokens(model_name, &options_set);
 		payload.x_insert("max_tokens", max_tokens)?; // required for Anthropic
+		if payload.get("tools").is_none() {
+			fit_thinking_budget_to_max_tokens(&mut payload, max_tokens);
+		}
 
 		if let Some(top_p) = options_set.top_p() {
 			payload.x_insert("top_p", top_p)?;
@@ -1072,6 +1104,72 @@ mod tests {
 		let options_set = ChatOptionsSet::default().with_chat_options(Some(&chat_options));
 		AnthropicAdapter::to_web_request_data(target, ServiceType::Chat, ChatRequest::from_user("hello"), options_set)
 			.expect("to_web_request_data should succeed")
+	}
+
+	fn build_request(
+		model_name: &str,
+		effort: ReasoningEffort,
+		max_tokens: Option<u32>,
+		chat_req: ChatRequest,
+	) -> WebRequestData {
+		let chat_options = ChatOptions {
+			reasoning_effort: Some(effort),
+			max_tokens,
+			..Default::default()
+		};
+		let target = ServiceTarget {
+			endpoint: AnthropicAdapter::default_endpoint(),
+			auth: AuthData::from_single("test-key"),
+			model: ModelIden::new(AdapterKind::Anthropic, model_name),
+		};
+		let options_set = ChatOptionsSet::default().with_chat_options(Some(&chat_options));
+		AnthropicAdapter::to_web_request_data(target, ServiceType::Chat, chat_req, options_set)
+			.expect("to_web_request_data should succeed")
+	}
+
+	#[test]
+	fn test_legacy_thinking_budget_is_lowered_below_max_tokens() {
+		let req = build_request(
+			"claude-3-7-sonnet",
+			ReasoningEffort::High,
+			Some(8000),
+			ChatRequest::from_user("hello"),
+		);
+		assert_eq!(req.payload.get("max_tokens").and_then(|v| v.as_u64()), Some(8000));
+		let thinking = req.payload.get("thinking").expect("thinking must be present");
+		assert_eq!(thinking.get("type").and_then(|v| v.as_str()), Some("enabled"));
+		assert_eq!(thinking.get("budget_tokens").and_then(|v| v.as_u64()), Some(4000));
+	}
+
+	#[test]
+	fn test_legacy_thinking_is_dropped_when_max_tokens_is_too_small() {
+		let req = build_request(
+			"claude-3-7-sonnet",
+			ReasoningEffort::Medium,
+			Some(1500),
+			ChatRequest::from_user("hello"),
+		);
+		assert!(req.payload.get("thinking").is_none(), "thinking must be dropped");
+	}
+
+	#[test]
+	fn test_legacy_thinking_budget_below_max_tokens_is_kept() {
+		let req = build_request(
+			"claude-3-7-sonnet",
+			ReasoningEffort::High,
+			None,
+			ChatRequest::from_user("hello"),
+		);
+		let thinking = req.payload.get("thinking").expect("thinking must be present");
+		assert_eq!(thinking.get("budget_tokens").and_then(|v| v.as_u64()), Some(24000));
+	}
+
+	#[test]
+	fn test_legacy_thinking_budget_with_tools_is_left_alone() {
+		let chat_req = ChatRequest::from_user("hello").with_tools(vec![crate::chat::Tool::new("probe")]);
+		let req = build_request("claude-3-7-sonnet", ReasoningEffort::High, Some(8000), chat_req);
+		let thinking = req.payload.get("thinking").expect("thinking must be present");
+		assert_eq!(thinking.get("budget_tokens").and_then(|v| v.as_u64()), Some(24000));
 	}
 
 	/// Regression guard: Opus 4.7+
