@@ -18379,7 +18379,11 @@ impl TerminalView {
         }
 
         self.update_find_selection(ctx);
-        ctx.focus(&self.input);
+        // Focusing the input while its editor has focus would move focus off the editor and back,
+        // and the blur commits an IME composition in progress as typed text.
+        if !self.input.as_ref(ctx).editor().is_focused(ctx) {
+            ctx.focus(&self.input);
+        }
         ctx.notify();
     }
 

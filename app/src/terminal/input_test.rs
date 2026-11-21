@@ -2934,6 +2934,57 @@ fn test_shell_lock_respected_when_slash_command_typed() {
 }
 
 #[test]
+fn refocusing_input_keeps_ime_composition() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let _ime_marked_text = FeatureFlag::ImeMarkedText.override_enabled(true);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let (input, editor) = terminal.read(&app, |terminal, ctx| {
+            let input = terminal.input().clone();
+            let editor = input.as_ref(ctx).editor().clone();
+            (input, editor)
+        });
+
+        // Focus corrections of an idle terminal land on the input's editor.
+        terminal.update(&mut app, |_, ctx| ctx.focus_self());
+        terminal.update(&mut app, |terminal, ctx| {
+            terminal.redetermine_global_focus(ctx);
+        });
+        assert!(editor.read(&app, |editor, _| editor.is_focused()));
+
+        // Type "nihao" into the IME, with no candidate picked yet.
+        editor.update(&mut app, |editor, ctx| {
+            editor.handle_action(
+                &EditorAction::SetMarkedText {
+                    marked_text: UserInput::new("nihao".to_owned()),
+                    selected_range: 5..5,
+                },
+                ctx,
+            );
+        });
+
+        // Focus is corrected again while the composition is in progress.
+        terminal.update(&mut app, |terminal, ctx| {
+            terminal.redetermine_global_focus(ctx);
+        });
+        input.update(&mut app, |input, ctx| input.focus_input_box(ctx));
+        assert!(editor.read(&app, |editor, _| editor.is_focused()));
+
+        // Picking "你好" replaces the composition instead of following it.
+        editor.update(&mut app, |editor, ctx| {
+            editor.handle_action(
+                &EditorAction::ImeCommit(UserInput::new("你好".to_owned())),
+                ctx,
+            );
+        });
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "你好");
+        });
+    });
+}
+
+#[test]
 fn test_new_conversation_keybinding_requires_double_press_in_non_empty_agent_view() {
     App::test((), |mut app| async move {
         let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
