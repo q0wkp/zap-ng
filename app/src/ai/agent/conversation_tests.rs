@@ -1008,3 +1008,70 @@ fn byop_silent_cli_subtask_fails_when_root_cannot_take_the_edge() {
     assert_eq!(conversation.all_tasks().count(), 1);
     assert!(!conversation.has_active_subagent());
 }
+
+#[test]
+fn tool_call_pair_message_ids_to_remove_takes_whole_pairs() {
+    use std::collections::HashSet;
+
+    use super::{tool_call_pair_message_ids_to_remove, MessageId};
+
+    fn tool_call(id: &str, tool_call_id: &str) -> api::Message {
+        api::Message {
+            id: id.to_string(),
+            task_id: "root-task".to_string(),
+            message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                tool_call_id: tool_call_id.to_string(),
+                tool: None,
+            })),
+            ..Default::default()
+        }
+    }
+    fn tool_call_result(id: &str, tool_call_id: &str) -> api::Message {
+        api::Message {
+            id: id.to_string(),
+            task_id: "root-task".to_string(),
+            message: Some(api::message::Message::ToolCallResult(
+                api::message::ToolCallResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    context: None,
+                    result: None,
+                },
+            )),
+            ..Default::default()
+        }
+    }
+    fn ids(ids: &[&str]) -> HashSet<MessageId> {
+        ids.iter()
+            .map(|id| MessageId::new(id.to_string()))
+            .collect()
+    }
+
+    let task = api::Task {
+        id: "root-task".to_string(),
+        messages: vec![
+            // Kept call, rewound result.
+            tool_call("a-call", "a"),
+            tool_call_result("a-result", "a"),
+            // Rewound call with two results.
+            tool_call("b-call", "b"),
+            tool_call_result("b-result-1", "b"),
+            tool_call_result("b-result-2", "b"),
+            // Untouched pair, and a call that never got a result.
+            tool_call("c-call", "c"),
+            tool_call_result("c-result", "c"),
+            tool_call("d-call", "d"),
+            // Messages without a tool call id are never paired.
+            tool_call("e-call", ""),
+            tool_call_result("e-result", ""),
+        ],
+        ..Default::default()
+    };
+
+    let extra =
+        tool_call_pair_message_ids_to_remove(&task, &ids(&["a-result", "b-call", "e-result"]));
+
+    assert_eq!(
+        extra,
+        ids(&["a-call", "a-result", "b-call", "b-result-1", "b-result-2"])
+    );
+}

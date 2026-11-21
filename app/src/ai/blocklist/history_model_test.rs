@@ -2067,3 +2067,248 @@ fn straddle_rewind_followup_requests_are_clean_and_durable() {
         );
     });
 }
+
+/// Returns the source of every task left in the task store after restoring
+/// `root_task` and `subtasks` and rewinding to the exchange holding
+/// `rewind_query`, including finished subtasks that are no longer active.
+fn restore_truncate_and_collect_sources(
+    app: &mut App,
+    root_task: warp_multi_agent_api::Task,
+    subtasks: Vec<warp_multi_agent_api::Task>,
+    rewind_query: &str,
+) -> Vec<warp_multi_agent_api::Task> {
+    let terminal_view_id = EntityId::new();
+    let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+    let conversation_id = AIConversationId::new();
+
+    let mut tasks = vec![root_task];
+    tasks.extend(subtasks);
+    let conversation = AIConversation::new_restored(conversation_id, tasks, None)
+        .expect("conversation should build");
+    history_model.update(app, |model, ctx| {
+        model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+    });
+
+    let rewind_exchange_id = history_model.read(app, |model, _| {
+        model
+            .conversation(&conversation_id)
+            .expect("conversation exists")
+            .root_task_exchanges()
+            .find(|exchange| {
+                exchange.input.iter().any(|input| {
+                    matches!(input, AIAgentInput::UserQuery { query, .. } if query == rewind_query)
+                })
+            })
+            .map(|exchange| exchange.id)
+            .expect("rewind exchange should exist")
+    });
+    history_model.update(app, |model, ctx| {
+        model
+            .truncate_conversation_from_exchange(conversation_id, rewind_exchange_id, ctx)
+            .expect("truncate should succeed");
+    });
+
+    history_model.read(app, |model, _| {
+        model
+            .conversation(&conversation_id)
+            .expect("conversation exists")
+            .all_tasks()
+            .filter_map(|task| task.source().cloned())
+            .collect()
+    })
+}
+
+/// Returns the message ids of the task `task_id` in `tasks`, in order.
+fn task_message_ids(tasks: &[warp_multi_agent_api::Task], task_id: &str) -> Vec<String> {
+    tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .expect("task should survive the rewind")
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect()
+}
+
+/// A regular tool call made before the rewind point whose result arrives in a
+/// rewound turn must go with its result: a kept call without its result makes
+/// every later request invalid. Older tool history the rewind does not touch,
+/// including a server tool call that never gets a result, stays as it was.
+#[test]
+fn rewind_removes_tool_call_whose_result_was_rewound() {
+    use crate::test_util::ai_agent_tasks::create_api_task;
+
+    App::test((), |mut app| async move {
+        initialize_history_model_test_app(&mut app);
+        let root_task_id = "root-task";
+
+        let root_task = create_api_task(
+            root_task_id,
+            vec![
+                // Turn 1 (kept).
+                create_user_query_message("m1", root_task_id, "req-1", "list files"),
+                server_tool_call_message("m2", root_task_id, "tc-server", "req-1"),
+                regular_tool_call_message("m3", root_task_id, "tc-done", "req-1"),
+                regular_tool_call_result_message("m4", root_task_id, "tc-done", "req-1"),
+                regular_tool_call_message("m5", root_task_id, "tc-long", "req-1"),
+                // Turn 2 (rewound): the long-running call's result arrives here.
+                create_user_query_message("m6", root_task_id, "req-2", "continue"),
+                regular_tool_call_result_message("m7", root_task_id, "tc-long", "req-2"),
+                agent_output_message("m8", root_task_id, "req-2", "done"),
+            ],
+        );
+
+        let sources = restore_truncate_and_collect_sources(&mut app, root_task, vec![], "continue");
+
+        assert_eq!(
+            task_message_ids(&sources, root_task_id),
+            vec!["m1", "m2", "m3", "m4"],
+            "the call whose result was rewound must be removed with it, and nothing else",
+        );
+    });
+}
+
+/// Tool call ids are matched within each task: a pair in a subtask that the
+/// rewind does not touch is kept, even when the root rewinds a pair with the
+/// same tool call id.
+#[test]
+fn rewind_matches_tool_call_pairs_within_each_task() {
+    use crate::test_util::ai_agent_tasks::{create_api_subtask, create_api_task};
+
+    App::test((), |mut app| async move {
+        initialize_history_model_test_app(&mut app);
+        let root_task_id = "root-task";
+        let subtask_id = "sub-1";
+
+        let (subagent_call, subagent_tool_call_id) =
+            make_subagent_call("m2", root_task_id, subtask_id, "req-1", None);
+
+        let root_task = create_api_task(
+            root_task_id,
+            vec![
+                // Turn 1 (kept): the sub-agent runs and finishes.
+                create_user_query_message("m1", root_task_id, "req-1", "do work"),
+                subagent_call,
+                subagent_tool_call_result_message(
+                    "m3",
+                    root_task_id,
+                    &subagent_tool_call_id,
+                    "req-1",
+                ),
+                regular_tool_call_message("m4", root_task_id, "tc-1", "req-1"),
+                // Turn 2 (rewound): the result of the root's own call.
+                create_user_query_message("m5", root_task_id, "req-2", "continue"),
+                regular_tool_call_result_message("m6", root_task_id, "tc-1", "req-2"),
+            ],
+        );
+        let subtask = create_api_subtask(
+            subtask_id,
+            root_task_id,
+            vec![
+                regular_tool_call_message("s1", subtask_id, "tc-1", "req-1"),
+                regular_tool_call_result_message("s2", subtask_id, "tc-1", "req-1"),
+            ],
+        );
+
+        let sources =
+            restore_truncate_and_collect_sources(&mut app, root_task, vec![subtask], "continue");
+
+        assert_eq!(
+            task_message_ids(&sources, root_task_id),
+            vec!["m1", "m2", "m3"]
+        );
+        assert_eq!(
+            task_message_ids(&sources, subtask_id),
+            vec!["s1", "s2"],
+            "a subtask's pair with the same tool call id must not be touched",
+        );
+    });
+}
+
+/// Builds a regular (non-sub-agent) `run_shell_command` tool_call message with
+/// `request_id` set and `tool_call_id`.
+fn regular_tool_call_message(
+    id: &str,
+    task_id: &str,
+    tool_call_id: &str,
+    request_id: &str,
+) -> warp_multi_agent_api::Message {
+    warp_multi_agent_api::Message {
+        id: id.to_string(),
+        task_id: task_id.to_string(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(warp_multi_agent_api::message::Message::ToolCall(
+            warp_multi_agent_api::message::ToolCall {
+                tool_call_id: tool_call_id.to_string(),
+                tool: Some(
+                    warp_multi_agent_api::message::tool_call::Tool::RunShellCommand(
+                        warp_multi_agent_api::message::tool_call::RunShellCommand {
+                            command: "echo hi".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            },
+        )),
+        request_id: request_id.to_string(),
+        timestamp: None,
+    }
+}
+
+/// Builds a real (non-cancel) `run_shell_command` tool_call_result message.
+fn regular_tool_call_result_message(
+    id: &str,
+    task_id: &str,
+    tool_call_id: &str,
+    request_id: &str,
+) -> warp_multi_agent_api::Message {
+    warp_multi_agent_api::Message {
+        id: id.to_string(),
+        task_id: task_id.to_string(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(warp_multi_agent_api::message::Message::ToolCallResult(
+            warp_multi_agent_api::message::ToolCallResult {
+                tool_call_id: tool_call_id.to_string(),
+                context: None,
+                result: Some(
+                    warp_multi_agent_api::message::tool_call_result::Result::RunShellCommand(
+                        warp_multi_agent_api::RunShellCommandResult::default(),
+                    ),
+                ),
+            },
+        )),
+        request_id: request_id.to_string(),
+        timestamp: None,
+    }
+}
+
+/// Builds a server-handled tool_call message (like the `RunPrimaryAgent`
+/// bootstrap call at the start of every root task), which never receives a
+/// result by design.
+fn server_tool_call_message(
+    id: &str,
+    task_id: &str,
+    tool_call_id: &str,
+    request_id: &str,
+) -> warp_multi_agent_api::Message {
+    warp_multi_agent_api::Message {
+        id: id.to_string(),
+        task_id: task_id.to_string(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(warp_multi_agent_api::message::Message::ToolCall(
+            warp_multi_agent_api::message::ToolCall {
+                tool_call_id: tool_call_id.to_string(),
+                tool: Some(warp_multi_agent_api::message::tool_call::Tool::Server(
+                    warp_multi_agent_api::message::tool_call::Server {
+                        payload: String::new(),
+                    },
+                )),
+            },
+        )),
+        request_id: request_id.to_string(),
+        timestamp: None,
+    }
+}
