@@ -590,6 +590,9 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
         $keepalive_options -t $argv \
 "
 export TERM_PROGRAM='WarpTerminal'
+# Mark the remote side of a Warp-managed SSH session so the bootstrap
+# body can distinguish it from local shells.
+export WARP_IS_SSH='1'
 test -n '$WARP_CLIENT_VERSION' && export WARP_CLIENT_VERSION='$WARP_CLIENT_VERSION'
 # Only forward the protocol version if it was set locally (i.e. the HOANotifications feature flag is on).
 test -n '$WARP_CLI_AGENT_PROTOCOL_VERSION' && export WARP_CLI_AGENT_PROTOCOL_VERSION='$WARP_CLI_AGENT_PROTOCOL_VERSION'
@@ -678,20 +681,6 @@ esac
 end
 
 warp_precmd
-
-# Print the MotD if this is a login shell. Normally, login(1) or pam_motd(8)
-# would do this. However, Warp does not use login(1) for local sessions and for
-# remote sessions, SSHD thinks it is starting a non-interactive session, so it
-# does not print PAM messages.
-if status --is-login
-  and test ! -e "$HOME/.hushlogin"
-  for motd_file in /etc/motd /run/motd /run/motd.dynamic /usr/lib/motd /usr/lib/motd.dynamic;
-    if test -r "$motd_file"
-      command cat "$motd_file"
-      break
-    end
-  end
-end
 
 warp_bootstrapped
 
