@@ -2881,24 +2881,37 @@ impl AIConversation {
     ///
     /// 实现:`Task::new_byop_silent_cli_subtask` 本地合成 `api::Task` + 合成
     /// `SubagentParams { command_id }`,task 一开始就 Server-backed。dependencies 指向
-    /// root task 让 conversation tree 完整。**不 emit CreatedSubtask**,由调用方
-    /// (cli_controller)在升级 block 后手动 emit `SpawnedSubagent` 创建浮窗。
-    pub fn create_optimistic_cli_subagent_task_silent(&mut self, block_id: &BlockId) -> TaskId {
+    /// root task,并往 root 追加一条虚拟 `Subagent` ToolCall 指向新 subtask:
+    /// `compute_active_tasks` 只顺着这类调用从 root 往下找,少了这条边,subtask 里的
+    /// 历史和工具调用都进不了下一轮请求,它们的结果成了孤儿,BYOP readiness 会拦下请求。
+    /// 这条调用不会发给模型(chat_stream 跳过 subagent 调用)。root 写不进去时返回
+    /// 错误,不建 subtask。**不 emit CreatedSubtask**,由调用方(cli_controller)在
+    /// 升级 block 后手动 emit `SpawnedSubagent` 创建浮窗。
+    pub fn create_optimistic_cli_subagent_task_silent(
+        &mut self,
+        block_id: &BlockId,
+    ) -> Result<TaskId, UpdateConversationError> {
+        let root_task_id = self.task_store.root_task_id().clone();
+        let (new_task, root_subagent_call) =
+            Task::new_byop_silent_cli_subtask(block_id.clone(), String::from(root_task_id.clone()));
+        let new_task_id = new_task.id().clone();
+        self.task_store
+            .modify_task(&root_task_id, |root_task| {
+                root_task.append_source_messages(vec![root_subagent_call])
+            })
+            .ok_or(UpdateConversationError::TaskNotFound)??;
+
         if self.optimistic_cli_subagent_subtask_id.take().is_some() {
             log::error!(
                 "Tried to optimistically create new subtask for CLI agent when one exists already."
             );
         }
-
-        let parent_task_id = String::from(self.task_store.root_task_id().clone());
-        let new_task = Task::new_byop_silent_cli_subtask(block_id.clone(), parent_task_id);
-        let new_task_id = new_task.id().clone();
         // 仍然记录到 optimistic_cli_subagent_subtask_id,保持
         // `has_active_subagent`、`controller.rs:1107-1130` 的 LRC subtask 检测路径
         // 与上游一致。该字段名仅指"未经 server 确认",和 task 内部存储格式无关。
         self.optimistic_cli_subagent_subtask_id = Some(new_task_id.clone());
         self.task_store.insert(new_task);
-        new_task_id
+        Ok(new_task_id)
     }
 
     pub fn is_subagent_task_finished(

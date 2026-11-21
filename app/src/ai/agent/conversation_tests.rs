@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::{
     artifact_from_fork_proto, AIConversation, AIConversationAutoexecuteMode, AIConversationId,
-    TaskId,
+    TaskId, UpdateConversationError,
 };
 use crate::ai::artifacts::Artifact;
 use crate::ai::blocklist::{
@@ -938,4 +938,73 @@ fn fork_artifacts_adds_file_artifacts_to_conversation() {
             size_bytes: Some(42),
         })
     );
+}
+
+#[test]
+fn byop_silent_cli_subtask_is_linked_from_root_and_active() {
+    let mut conversation = restored_conversation_with_queries(&["start the dev server"]);
+    let block_id = BlockId::from("lrc-block-1".to_string());
+
+    let subtask_id = conversation
+        .create_optimistic_cli_subagent_task_silent(&block_id)
+        .expect("silent subtask should be created");
+
+    let root_task = conversation.get_root_task().expect("root task exists");
+    let (root_tool_call_id, root_subagent_call) = root_task
+        .messages()
+        .find_map(|message| match &message.message {
+            Some(api::message::Message::ToolCall(api::message::ToolCall {
+                tool_call_id,
+                tool: Some(api::message::tool_call::Tool::Subagent(subagent)),
+            })) => Some((tool_call_id.clone(), subagent.clone())),
+            _ => None,
+        })
+        .expect("root should hold a Subagent call for the silent subtask");
+    assert_eq!(root_subagent_call.task_id, String::from(subtask_id.clone()));
+
+    let subtask = conversation.get_task(&subtask_id).expect("subtask exists");
+    assert_eq!(
+        subtask.parent_id(),
+        Some(conversation.get_root_task_id().clone())
+    );
+    assert_eq!(subtask.cli_subagent_block_id(), Some(block_id));
+    assert_eq!(
+        subtask
+            .subagent_params()
+            .expect("subtask has subagent params")
+            .tool_call_id,
+        root_tool_call_id
+    );
+
+    let active_task_ids: Vec<String> = conversation
+        .compute_active_tasks()
+        .into_iter()
+        .map(|task| task.id)
+        .collect();
+    assert!(
+        active_task_ids.contains(&String::from(subtask_id.clone())),
+        "the silent subtask must be part of the next request, got {active_task_ids:?}"
+    );
+    assert!(matches!(
+        conversation.is_subagent_task_finished(&subtask_id),
+        Ok(false)
+    ));
+    assert!(conversation.has_active_subagent());
+}
+
+#[test]
+fn byop_silent_cli_subtask_fails_when_root_cannot_take_the_edge() {
+    // A conversation whose root task was never initialized by CreateTask has no source to
+    // append the Subagent call to, so no unreachable subtask may be created.
+    let mut conversation = AIConversation::new(false);
+
+    let result = conversation
+        .create_optimistic_cli_subagent_task_silent(&BlockId::from("lrc-block-1".to_string()));
+
+    assert!(matches!(
+        result,
+        Err(UpdateConversationError::UpdateTask(_))
+    ));
+    assert_eq!(conversation.all_tasks().count(), 1);
+    assert!(!conversation.has_active_subagent());
 }

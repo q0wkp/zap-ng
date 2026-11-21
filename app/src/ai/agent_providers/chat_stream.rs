@@ -526,15 +526,35 @@ fn collect_linearized_task_messages(tasks: &[api::Task]) -> Vec<&api::Message> {
         if !visited_tasks.insert(task.id.as_str()) {
             return;
         }
+        // 遇到 Subagent ToolCall 不立刻下钻:紧跟其后、回应本 task 更早工具调用的
+        // ToolCallResult 先输出,再进 subtask。BYOP 静默 LRC subtask 的虚拟调用挂在
+        // run_command 调用之后、它的 snapshot 结果写进 root 之前;若先下钻,subtask 的
+        // 后续消息会插在 run_command 调用和结果之间,readiness 会把请求拦下。
+        let mut pending_subtasks: Vec<&'a api::Task> = Vec::new();
+        let mut subagent_call_ids: HashSet<&'a str> = HashSet::new();
         for msg in &task.messages {
+            let answers_earlier_call = matches!(
+                &msg.message,
+                Some(api::message::Message::ToolCallResult(result))
+                    if !subagent_call_ids.contains(result.tool_call_id.as_str())
+            );
+            if !answers_earlier_call {
+                for subtask in pending_subtasks.drain(..) {
+                    dfs(subtask, by_id, visited_tasks, out, seen_user_queries);
+                }
+            }
             push_msg(msg, out, seen_user_queries);
             if let Some(api::message::Message::ToolCall(tc)) = &msg.message {
                 if let Some(api::message::tool_call::Tool::Subagent(sub)) = &tc.tool {
+                    subagent_call_ids.insert(tc.tool_call_id.as_str());
                     if let Some(subtask) = by_id.get(sub.task_id.as_str()) {
-                        dfs(subtask, by_id, visited_tasks, out, seen_user_queries);
+                        pending_subtasks.push(*subtask);
                     }
                 }
             }
+        }
+        for subtask in pending_subtasks {
+            dfs(subtask, by_id, visited_tasks, out, seen_user_queries);
         }
     }
 
@@ -7006,6 +7026,54 @@ mod serializer_readiness_tests {
             "request body ordering errors: {errors:?}"
         );
         assert_request_has_no_repair_placeholder(&request);
+    }
+
+    #[test]
+    fn build_chat_request_body_keeps_result_before_silent_lrc_subtask() {
+        // The silent LRC subtask's Subagent call is appended to the root after the
+        // run_command call and before its snapshot result reaches the root. The subtask's
+        // later messages must not end up between that call and its result.
+        let mut subtask = task_with_messages(vec![
+            make_user_query_message("subtask-1", "req-2", "is it up?".to_owned(), &[]),
+            make_tool_call_message("subtask-1", "req-2", "call-2", shell_tool()),
+            make_tool_call_result_message(
+                "subtask-1",
+                "req-2",
+                "call-2".to_owned(),
+                r#"{"status":"done"}"#.to_owned(),
+            ),
+        ]);
+        subtask.id = "subtask-1".to_owned();
+        subtask.dependencies = Some(api::task::Dependencies {
+            parent_task_id: "task-1".to_owned(),
+        });
+        let root = task_with_messages(vec![
+            make_user_query_message("task-1", "req-1", "start the server".to_owned(), &[]),
+            make_tool_call_message("task-1", "req-1", "call-1", shell_tool()),
+            make_tool_call_message("task-1", "", "subagent-call-1", subagent_tool()),
+            make_tool_call_result_message(
+                "task-1",
+                "req-1",
+                "call-1".to_owned(),
+                r#"{"status":"snapshot"}"#.to_owned(),
+            ),
+        ]);
+        let params = RequestParams::new_for_test(vec![], vec![root, subtask]);
+
+        let request = build_openai_request(&params)
+            .expect("the silent subtask must not split a call from its result");
+        let errors = strict_chat_completions_ordering_errors(&request.messages);
+        assert!(
+            errors.is_empty(),
+            "request body ordering errors: {errors:?}"
+        );
+        let tool_response_ids: Vec<String> = request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.tool_responses())
+            .map(|response| response.call_id.clone())
+            .collect();
+        assert_eq!(tool_response_ids, vec!["call-1", "call-2"]);
     }
 
     #[test]
