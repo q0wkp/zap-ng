@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Jeremy Chone
+// SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
+// SPDX-License-Identifier: (MIT OR Apache-2.0) AND AGPL-3.0-only
+// Modified by Tianyu (Sky) Lu in 2026: captured reasoning items whole, so that they can be sent back.
+
+use super::adapter_impl::reasoning_item_signature;
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
 use crate::adapter::openai_resp::resp_types::RespResponse;
@@ -230,17 +236,13 @@ impl futures::Stream for OpenAIRespStreamer {
 								self.captured_data.tool_calls = Some(tool_calls.clone());
 							}
 
-							// Extract encrypted reasoning content from output items
-							// (OpenAI equivalent of Gemini thought signatures).
+							// Capture the reasoning items that carry encrypted content (the OpenAI
+							// equivalent of Gemini thought signatures) whole, in output order: with
+							// `store: false` the provider keeps nothing, so the next request has to
+							// send them back as they came for the model to see its own reasoning.
 							if self.options.capture_reasoning_content {
-								let mut thought_sigs: Vec<String> = Vec::new();
-								for item in &response.output {
-									if item.x_get_str("type").ok() == Some("reasoning")
-										&& let Ok(encrypted) = item.x_get_str("encrypted_content")
-									{
-										thought_sigs.push(encrypted.to_string());
-									}
-								}
+								let thought_sigs: Vec<String> =
+									response.output.iter().filter_map(reasoning_item_signature).collect();
 								if !thought_sigs.is_empty() {
 									self.captured_data.thought_signatures = Some(thought_sigs);
 								}

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: made the Ollama URL normalizer reusable, added per-profile prompt overrides for titles, a request inspector hook, and secret redaction of outbound requests; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: made the Ollama URL normalizer reusable, added per-profile prompt overrides for titles, a request inspector hook, and secret redaction of outbound requests; renamed the Warp and Zap names to ZapNG; kept the encrypted reasoning of OpenAI Responses across requests.
 
 //! BYOP 模式下 chat completion + tool calling 适配层(基于 genai 0.5.3)。
 //!
@@ -80,6 +80,7 @@ use ai::agent::convert::ConvertToAPITypeError;
 
 use super::openai_compatible::OpenAiCompatibleError;
 use super::request_inspector::{self, CallKind, CallOrigin};
+use super::responses_reasoning::{self, ReasoningScope};
 use super::tools;
 
 // ---------------------------------------------------------------------------
@@ -280,6 +281,10 @@ struct AssistantBuffer {
     /// thinking-mode adapter 强制回传 reasoning_content(非空占位)。由
     /// `super::reasoning::model_requires_reasoning_echo` 决定。
     force_echo_reasoning: bool,
+    /// Encrypted reasoning items of the OpenAI Responses API that came with this turn, as
+    /// thought signatures; flushed in front of the turn's first assistant message, where the
+    /// response had them (see `responses_reasoning`).
+    reasoning_items: Vec<String>,
 }
 
 impl AssistantBuffer {
@@ -304,6 +309,7 @@ impl AssistantBuffer {
         messages: &mut Vec<ChatMessage>,
     ) -> Option<OutboundAssistantToolGroup> {
         let reasoning = self.reasoning.take();
+        let mut reasoning_items = std::mem::take(&mut self.reasoning_items);
         let has_tool_calls = !self.tool_calls.is_empty();
         // 决定本次 flush 要挂到 assistant message 上的 reasoning 字符串。
         //
@@ -337,6 +343,8 @@ impl AssistantBuffer {
             } else if let Some(r) = echo_reasoning.clone() {
                 msg = msg.with_reasoning_content(Some(r));
             }
+            msg.content
+                .extend_front(reasoning_items.drain(..).map(ContentPart::ThoughtSignature));
             messages.push(msg);
         }
         if has_tool_calls {
@@ -346,6 +354,8 @@ impl AssistantBuffer {
             if let Some(r) = echo_reasoning {
                 msg = msg.with_reasoning_content(Some(r));
             }
+            msg.content
+                .extend_front(reasoning_items.drain(..).map(ContentPart::ThoughtSignature));
             let message_index = messages.len();
             messages.push(msg);
             Some(OutboundAssistantToolGroup {
@@ -1203,8 +1213,15 @@ fn build_outbound_chat_request(
     force_echo_reasoning: bool,
     api_type: AgentProviderApiType,
     attachment_caps: attachment_caps::AttachmentCaps,
+    reasoning_scope: Option<&ReasoningScope>,
 ) -> Result<ChatRequest, ConvertToAPITypeError> {
-    let mut chat_req = build_chat_request(params, force_echo_reasoning, api_type, attachment_caps)?;
+    let mut chat_req = build_chat_request(
+        params,
+        force_echo_reasoning,
+        api_type,
+        attachment_caps,
+        reasoning_scope,
+    )?;
     if params.should_redact_secrets {
         super::secret_redaction::redact_chat_request(&mut chat_req);
     }
@@ -1216,11 +1233,15 @@ fn build_outbound_chat_request(
 /// `force_echo_reasoning`:由 `super::reasoning::model_requires_reasoning_echo`
 /// 决定。true 时所有 assistant message 强制挂 reasoning_content(空串占位),
 /// 修复 DeepSeek-v4-flash / Kimi 等收紧校验的 thinking-mode endpoint。
+///
+/// `reasoning_scope`: set when the request goes out through the OpenAI Responses adapter; the
+/// encrypted reasoning items kept in the history for that endpoint and model are sent back.
 fn build_chat_request(
     params: &RequestParams,
     force_echo_reasoning: bool,
     api_type: AgentProviderApiType,
     attachment_caps: attachment_caps::AttachmentCaps,
+    reasoning_scope: Option<&ReasoningScope>,
 ) -> Result<ChatRequest, ConvertToAPITypeError> {
     let agent_ctx = latest_input_context(&params.input);
     let plan_mode = is_plan_mode_turn(&params.input);
@@ -1448,6 +1469,13 @@ fn build_chat_request(
                         Some(existing) => existing.push_str(&next),
                         None => buf.reasoning = Some(next),
                     }
+                }
+                // The encrypted reasoning items of a Responses turn ride on a reasoning message
+                // without text, added after the turn's output and before anything that flushes
+                // it, so they belong to the buffer as it stands.
+                if let Some(scope) = reasoning_scope {
+                    buf.reasoning_items
+                        .extend(responses_reasoning::decode(&msg.server_message_data, scope));
                 }
             }
             api::message::Message::AgentOutput(a) => {
@@ -3406,11 +3434,18 @@ pub async fn generate_byop_output(
         } else {
             api_type
         };
+    // The Responses API runs with `store: false`: the encrypted reasoning items of each
+    // response are kept in the conversation and sent back to the endpoint and model that gave
+    // them (see `responses_reasoning`).
+    let reasoning_scope = (effective_adapter_kind_for(api_type, &model_id, &base_url)
+        == AdapterKind::OpenAIResp)
+        .then(|| ReasoningScope::new(&normalize_endpoint_url(api_type, &base_url), &model_id));
     let chat_req = build_outbound_chat_request(
         &params,
         force_echo_reasoning,
         shaping_api_type,
         attachment_caps,
+        reasoning_scope.as_ref(),
     )?;
     let conversation_id = params
         .conversation_token
@@ -3817,6 +3852,8 @@ pub async fn generate_byop_output(
         // 依然保持 0。
         let mut captured_cache_read_tokens: i32 = 0;
         let mut captured_cache_create_tokens: i32 = 0;
+        // Thought signatures of the Responses API: the encrypted reasoning items of this turn.
+        let mut captured_reasoning_items: Vec<String> = Vec::new();
 
         while let Some(item) = sdk_stream.next().await {
             let event = match item {
@@ -4078,6 +4115,14 @@ pub async fn generate_byop_output(
                                 captured_assistant_text = Some(text.to_owned());
                             }
                         }
+                        if reasoning_scope.is_some() {
+                            captured_reasoning_items.extend(
+                                content
+                                    .thought_signatures()
+                                    .into_iter()
+                                    .map(str::to_owned),
+                            );
+                        }
                         let mut captured_order: Vec<String> = Vec::new();
                         for call in content.tool_calls() {
                             if !captured_order.contains(&call.call_id) {
@@ -4123,7 +4168,7 @@ pub async fn generate_byop_output(
                 _ => {
                     other_count += 1;
                     // ThoughtSignatureChunk 等暂不处理(Gemini 3 thoughts 需要回传给后续轮次,
-                    // 当前 BYOP 不持久化 thought_signatures,接受降级)
+                    // 当前 BYOP 只为 OpenAI Responses 持久化 thought_signatures,见 End 分支)
                 }
             }
         }
@@ -4232,6 +4277,18 @@ pub async fn generate_byop_output(
                 "[byop] stream returned 0 content / 0 reasoning / 0 tool_calls — \
                  上游可能返回空响应(model_id 错? max_tokens 缺? proxy 异常?)"
             );
+        }
+
+        // Keep the turn's encrypted reasoning items on a reasoning message without text (nothing
+        // is shown for it), added after the turn's output and before the tool results below, so
+        // that the next request sends them back with this turn.
+        if let Some(data) = reasoning_scope
+            .as_ref()
+            .and_then(|scope| responses_reasoning::encode(scope, &captured_reasoning_items))
+        {
+            let mut carrier = make_reasoning_message(&current_task_id, &request_id, String::new());
+            carrier.server_message_data = data;
+            yield Ok(make_add_messages_event(&current_task_id, vec![carrier]));
         }
 
         // 流结束:把累积的 tool_calls 一次性发出。
@@ -6364,6 +6421,7 @@ mod serializer_readiness_tests {
             false,
             AgentProviderApiType::OpenAi,
             attachment_caps::AttachmentCaps::default(),
+            None,
         )
     }
 
@@ -7969,6 +8027,7 @@ mod outbound_secret_redaction_tests {
             false,
             api_type,
             attachment_caps::AttachmentCaps::default(),
+            None,
         )
         .expect("request builds");
         serde_json::to_string(&req).expect("request serializes")
@@ -8010,5 +8069,122 @@ mod outbound_secret_redaction_tests {
         params.should_redact_secrets = true;
         let redacted = outbound_wire(&params, AgentProviderApiType::OpenAi);
         assert!(!redacted.contains(SECRET), "a secret is sent: {redacted}");
+    }
+}
+
+/// The encrypted reasoning items of an OpenAI Responses turn are kept on a reasoning message
+/// without text and sent back in front of that turn's output, to the endpoint and model that
+/// produced them only.
+#[cfg(test)]
+mod responses_reasoning_replay_tests {
+    use super::*;
+    use crate::test_util::ai_agent_tasks::create_api_task;
+
+    fn reasoning_item() -> String {
+        json!({
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "gAAAA-encrypted",
+        })
+        .to_string()
+    }
+
+    fn scope() -> ReasoningScope {
+        ReasoningScope::new("https://api.openai.com/v1/", "gpt-5")
+    }
+
+    fn thought_signatures(msg: &ChatMessage) -> Vec<&str> {
+        msg.content.thought_signatures()
+    }
+
+    fn tool_call() -> ToolCall {
+        ToolCall {
+            call_id: "c1".to_string(),
+            fn_name: "echo".to_string(),
+            fn_arguments: json!({}),
+            thought_signatures: None,
+        }
+    }
+
+    #[test]
+    fn reasoning_items_lead_the_first_assistant_message_of_their_turn() {
+        let mut buf = AssistantBuffer::new(false);
+        buf.text = Some("calling".to_string());
+        buf.tool_calls = vec![tool_call()];
+        buf.reasoning_items = vec![reasoning_item()];
+        let mut msgs = Vec::new();
+        buf.flush_into(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(
+            msgs[0].content.parts().first(),
+            Some(ContentPart::ThoughtSignature(_))
+        ));
+        assert_eq!(
+            thought_signatures(&msgs[0]),
+            vec![reasoning_item().as_str()]
+        );
+        assert!(thought_signatures(&msgs[1]).is_empty());
+
+        let mut buf = AssistantBuffer::new(false);
+        buf.tool_calls = vec![tool_call()];
+        buf.reasoning_items = vec![reasoning_item()];
+        let mut msgs = Vec::new();
+        buf.flush_into(&mut msgs);
+        assert_eq!(
+            thought_signatures(&msgs[0]),
+            vec![reasoning_item().as_str()]
+        );
+        assert!(buf.reasoning_items.is_empty());
+    }
+
+    fn params_with_kept_reasoning() -> RequestParams {
+        let mut carrier = make_reasoning_message("task-1", "req-0", String::new());
+        carrier.server_message_data =
+            responses_reasoning::encode(&scope(), &[reasoning_item()]).expect("kept");
+        let history = vec![
+            make_user_query_message("task-1", "req-0", "first".to_owned(), &[]),
+            make_agent_output_message("task-1", "req-0", "answer".to_owned()),
+            carrier,
+        ];
+        let input = AIAgentInput::UserQuery {
+            query: "next".to_owned(),
+            context: Arc::from([]),
+            static_query_type: None,
+            referenced_attachments: HashMap::new(),
+            user_query_mode: UserQueryMode::default(),
+            running_command: None,
+            intended_agent: None,
+        };
+        RequestParams::new_for_test(vec![input], vec![create_api_task("task-1", history)])
+    }
+
+    fn assistant_signatures(scope: Option<&ReasoningScope>) -> Vec<String> {
+        let req = build_chat_request(
+            &params_with_kept_reasoning(),
+            false,
+            AgentProviderApiType::OpenAiResp,
+            attachment_caps::AttachmentCaps::default(),
+            scope,
+        )
+        .expect("request builds");
+        req.messages
+            .iter()
+            .filter(|msg| msg.role == ChatRole::Assistant)
+            .flat_map(|msg| msg.content.thought_signatures())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn kept_reasoning_items_go_back_with_their_turn() {
+        assert_eq!(assistant_signatures(Some(&scope())), vec![reasoning_item()]);
+    }
+
+    #[test]
+    fn kept_reasoning_items_stay_out_of_other_requests() {
+        assert!(assistant_signatures(None).is_empty());
+        let other_model = ReasoningScope::new("https://api.openai.com/v1/", "gpt-5-mini");
+        assert!(assistant_signatures(Some(&other_model)).is_empty());
     }
 }

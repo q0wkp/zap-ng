@@ -28,6 +28,7 @@ pub mod openai_compatible;
 pub mod prompt_renderer;
 pub mod reasoning;
 pub mod request_inspector;
+mod responses_reasoning;
 mod secret_redaction;
 pub mod secrets;
 pub mod tools;

@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Jeremy Chone
+// SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
+// SPDX-License-Identifier: (MIT OR Apache-2.0) AND AGPL-3.0-only
+// Modified by Tianyu (Sky) Lu in 2026: sent captured reasoning items back as input items.
+
 use crate::adapter::adapters::support::get_api_key;
 use crate::adapter::openai::OpenAIAdapter;
 use crate::adapter::openai_resp::OpenAIRespStreamer;
@@ -480,10 +485,26 @@ impl OpenAIRespAdapter {
 								}))
 							}
 
+							// A reasoning item captured from an earlier response goes back as an input
+							// item of its own, ahead of the text and calls that came after it. The
+							// signatures of other providers are no reasoning items and are left out.
+							ContentPart::ThoughtSignature(signature) => {
+								if let Some(reasoning_item) = reasoning_item_from_signature(&signature) {
+									if !item_message_content.is_empty() {
+										input_items.push(json!({
+											"type": "message",
+											"role": "assistant",
+											"content": item_message_content
+										}));
+										item_message_content = Vec::new();
+									}
+									input_items.push(reasoning_item);
+								}
+							}
+
 							// TODO: Probably need towarn on this one (probably need to add binary here)
 							ContentPart::Binary(_) => {}
 							ContentPart::ToolResponse(_) => {}
-							ContentPart::ThoughtSignature(_) => {}
 							ContentPart::ReasoningContent(_) => {}
 							// Custom are ignored for this logic
 							ContentPart::Custom(_) => {}
@@ -596,6 +617,25 @@ struct OpenAIRespRequestParts {
 	tools: Option<Vec<Value>>,
 }
 
+/// The thought signature of a reasoning output item that carries encrypted content: the whole
+/// item as JSON, its id and any field the API adds later included, so that it can be sent back
+/// as it came.
+pub(super) fn reasoning_item_signature(item: &Value) -> Option<String> {
+	let is_reasoning = item.x_get_str("type").ok() == Some("reasoning");
+	if !is_reasoning || item.x_get_str("encrypted_content").is_err() {
+		return None;
+	}
+	serde_json::to_string(item).ok()
+}
+
+/// The reasoning item a thought signature from [`reasoning_item_signature`] holds, or `None` for
+/// any other signature.
+fn reasoning_item_from_signature(signature: &str) -> Option<Value> {
+	let item: Value = serde_json::from_str(signature).ok()?;
+	let is_reasoning = item.x_get_str("type").ok() == Some("reasoning");
+	(is_reasoning && item.x_get_str("encrypted_content").is_ok()).then_some(item)
+}
+
 // endregion: --- Support
 
 // region:    --- Tests
@@ -604,7 +644,7 @@ struct OpenAIRespRequestParts {
 mod tests {
 	use super::*;
 	use crate::adapter::AdapterKind;
-	use crate::chat::ChatMessage;
+	use crate::chat::{ChatMessage, ToolCall};
 
 	/// Test that assistant message text content uses "output_text" type (not "input_text").
 	///
@@ -653,6 +693,48 @@ mod tests {
 			content_type, "output_text",
 			"Assistant message content should use 'output_text' type, not 'input_text'"
 		);
+	}
+
+	/// Reasoning items captured from a response go back whole, in front of the text and calls
+	/// that followed them; signatures of other providers are not sent.
+	#[test]
+	fn test_captured_reasoning_items_are_sent_back_before_the_assistant_output() {
+		let model_iden = ModelIden::new(AdapterKind::OpenAIResp, "gpt-5");
+		let reasoning_item = json!({
+			"id": "rs_1",
+			"type": "reasoning",
+			"summary": [],
+			"encrypted_content": "gAAAA-encrypted",
+			"a_field_added_later": {"kept": true},
+		});
+		let signature = reasoning_item_signature(&reasoning_item).expect("a reasoning item with encrypted content");
+		assert!(reasoning_item_signature(&json!({"type": "reasoning", "summary": []})).is_none());
+		assert!(reasoning_item_signature(&json!({"type": "message", "encrypted_content": "x"})).is_none());
+
+		let tool_call = ToolCall {
+			call_id: "call_1".to_string(),
+			fn_name: "read_files".to_string(),
+			fn_arguments: json!({"path": "a.rs"}),
+			thought_signatures: None,
+		};
+		let assistant = ChatMessage::assistant(MessageContent::from_parts(vec![
+			ContentPart::ThoughtSignature(signature),
+			ContentPart::ThoughtSignature("a-gemini-thought-signature".to_string()),
+			ContentPart::Text("Reading it.".to_string()),
+			ContentPart::ToolCall(tool_call),
+		]));
+		let chat_req = ChatRequest::default()
+			.append_message(ChatMessage::user("Read a.rs"))
+			.append_message(assistant);
+
+		let parts = OpenAIRespAdapter::into_openai_request_parts(&model_iden, chat_req).expect("serializes");
+		let types: Vec<&str> = parts
+			.input_items
+			.iter()
+			.map(|item| item["type"].as_str().unwrap_or(""))
+			.collect();
+		assert_eq!(types, ["", "reasoning", "message", "function_call"]);
+		assert_eq!(parts.input_items[1], reasoning_item);
 	}
 }
 
