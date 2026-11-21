@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: made a rejected BYOP summary final rather than retried; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: made a rejected BYOP summary and a BYOP context-window overflow final rather than retried; renamed the Warp and Zap names to ZapNG.
 
+use crate::ai::agent_providers::context_overflow::ByopContextOverflowError;
+use crate::ai::byop_compaction::commit::IncompleteSummaryError;
 use crate::ai::byop_readiness::BlockedByopReadinessError;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -170,10 +172,8 @@ impl AIApiError {
             | AIApiError::Stream { .. } => true,
             AIApiError::Other(error) => {
                 error.downcast_ref::<BlockedByopReadinessError>().is_none()
-                    && error
-                        .downcast_ref::<crate::ai::byop_compaction::commit::IncompleteSummaryError>(
-                        )
-                        .is_none()
+                    && error.downcast_ref::<IncompleteSummaryError>().is_none()
+                    && error.downcast_ref::<ByopContextOverflowError>().is_none()
             }
         }
     }

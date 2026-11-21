@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: made the Ollama URL normalizer reusable, added per-profile prompt overrides for titles, a request inspector hook, secret redaction of outbound requests, BYOP auto-compaction against the model's window, and a byte budget for the tool results a request sends; renamed the Warp and Zap names to ZapNG; kept the encrypted reasoning of OpenAI Responses across requests.
+// Modified by Tianyu (Sky) Lu in 2026: made the Ollama URL normalizer reusable, added per-profile prompt overrides for titles, a request inspector hook, secret redaction of outbound requests, BYOP auto-compaction against the model's window, a byte budget for the tool results a request sends, and final context-window overflow errors; renamed the Warp and Zap names to ZapNG; kept the encrypted reasoning of OpenAI Responses across requests.
 
 //! BYOP 模式下 chat completion + tool calling 适配层(基于 genai 0.5.3)。
 //!
@@ -3542,6 +3542,18 @@ fn build_chat_options(
     opts
 }
 
+/// The error a failed BYOP request ends its stream with: a request refused as larger than the
+/// model's window becomes [`super::context_overflow::ByopContextOverflowError`], which is never
+/// retried, whatever status wraps it; anything else keeps the provider's message.
+fn byop_request_error(context: &str, error: &OpenAiCompatibleError) -> AIApiError {
+    let message = error.to_string();
+    if super::context_overflow::is_context_overflow(&message) {
+        AIApiError::Other(super::context_overflow::ByopContextOverflowError::new(&message).into())
+    } else {
+        AIApiError::Other(anyhow::anyhow!("{context}: {message}"))
+    }
+}
+
 fn map_genai_error(err: genai::Error) -> OpenAiCompatibleError {
     use genai::Error as G;
     match err {
@@ -4023,9 +4035,7 @@ pub async fn generate_byop_output(
                 if let Some(call) = inspector_call.take() {
                     call.fail(&mapped);
                 }
-                yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
-                    "BYOP open stream failed: {mapped}"
-                ))));
+                yield Err(Arc::new(byop_request_error("BYOP open stream failed", &mapped)));
                 return;
             }
         };
@@ -4118,9 +4128,7 @@ pub async fn generate_byop_output(
                             log::error!("[byop] error bytes[{hex_start}..{hex_end}] hex={slice:02x?}");
                         }
                     }
-                    yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
-                        "BYOP stream error: {mapped}"
-                    ))));
+                    yield Err(Arc::new(byop_request_error("BYOP stream error", &mapped)));
                     return;
                 }
             };

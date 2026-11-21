@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: declared the new explain-command, Ollama, custom-prompt, request-inspector and secret-redaction modules, made disabled providers and models offer nothing, looked up a model's token limit for compaction, and capped the tool results a request sends; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: declared the new explain-command, Ollama, custom-prompt, request-inspector and secret-redaction modules, made disabled providers and models offer nothing, looked up a model's token limit for compaction, capped the tool results a request sends, and recognized context-window overflow errors; renamed the Warp and Zap names to ZapNG.
 
 //! 自定义 Agent 提供商支持。
 //!
@@ -18,6 +18,7 @@ pub mod active_ai;
 pub mod attachment_caps;
 pub mod chat_stream;
 pub mod content_tool_calls;
+pub mod context_overflow;
 pub mod custom_prompts;
 pub mod explain_command;
 pub mod llm_id;

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: added an output message type and plain-text summary for tool calls whose arguments were invalid; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: added an output message type and plain-text summary for tool calls whose arguments were invalid, and showed a BYOP context-window overflow as such; renamed the Warp and Zap names to ZapNG.
 
 pub(crate) mod conversation;
 pub(crate) mod conversation_yaml;
@@ -676,6 +676,13 @@ impl From<&AIApiError> for RenderableAIError {
         match value {
             AIApiError::QuotaLimit => Self::QuotaLimit,
             AIApiError::ServerOverloaded => Self::ServerOverloaded,
+            AIApiError::Other(error)
+                if error
+                    .downcast_ref::<crate::ai::agent_providers::context_overflow::ByopContextOverflowError>()
+                    .is_some() =>
+            {
+                Self::ContextWindowExceeded(error.to_string())
+            }
             AIApiError::Other(error) => Self::Other {
                 error_message: error.to_string(),
                 will_attempt_resume: false,
