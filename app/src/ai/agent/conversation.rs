@@ -3770,11 +3770,23 @@ impl AIConversation {
             return Ok(exchanges_to_remove);
         }
 
-        let message_ids_to_remove: HashSet<MessageId> = exchanges_to_remove
+        let mut message_ids_to_remove: HashSet<MessageId> = exchanges_to_remove
             .iter()
             .filter_map(|ex_id| self.exchange_with_id(*ex_id))
             .flat_map(|ex| ex.added_message_ids.iter().cloned())
             .collect();
+
+        // Reconcile tool call/result pairs in every task so the rewind never
+        // leaves a dangling `tool_call` or `tool_call_result` behind (see the
+        // helper's doc comment for why). A sub-agent whose call is removed this
+        // way leaves an unreferenced subtask, which is pruned below.
+        let extra_ids: Vec<MessageId> = self
+            .task_store
+            .tasks()
+            .filter_map(Task::source)
+            .flat_map(|source| tool_call_pair_message_ids_to_remove(source, &message_ids_to_remove))
+            .collect();
+        message_ids_to_remove.extend(extra_ids);
 
         if let Some(new_todo_lists) = self.task_store.modify_root_task(|root_task| {
             root_task.truncate_exchanges_from(from_exchange_id);
@@ -3785,6 +3797,22 @@ impl AIConversation {
         }) {
             self.todo_lists = new_todo_lists;
         }
+
+        // Remove the rewound messages from every non-root task as well.
+        // Summarization (`MoveMessagesToNewTask`) relocates rewound root
+        // messages into a subtask while the root exchange's `added_message_ids`
+        // still reference them; a root-only removal would let them survive into
+        // the next request.
+        self.task_store
+            .remove_messages_from_non_root_tasks(&message_ids_to_remove);
+
+        // Prune subtasks that are no longer reachable from the root via a
+        // surviving sub-agent tool call: orphaned subtasks whose invocation was
+        // rewound, and straddle subtasks whose call we just stripped. This
+        // repair is durable — it mutates the task store, which is snapshotted by
+        // `write_updated_conversation_state` below — so follow-up sends and a
+        // persist/restore round-trip stay clean.
+        self.task_store.prune_unreachable_subtasks();
 
         // Make sure we don't have stale code review comment state
         self.code_review = None;
@@ -3850,6 +3878,54 @@ fn is_pure_text_or_reasoning_mask(mask: &prost_types::FieldMask) -> bool {
             .paths
             .iter()
             .all(|p| p == "agent_output.text" || p == "agent_reasoning.reasoning")
+}
+
+/// Computes the additional message ids to remove during a rewind so that no
+/// `tool_call`/`tool_call_result` pair in `task_source` is left half removed.
+///
+/// Providers reject a request that carries a tool call without its result, or
+/// a result without its call, so a conversation holding either can never be
+/// sent again. The ids a rewind removes come from the rewound exchanges'
+/// `added_message_ids`, which can split a pair: a long-running call (such as
+/// a terminal sub-agent) made before the rewind point whose result lands in a
+/// rewound turn, or a result that only exists in the task's source and was
+/// never among an exchange's added messages. So if a call or any of its
+/// results is in `removed_ids`, this returns the ids of the call and of every
+/// result with the same `tool_call_id` in this task. Pairs the rewind does not
+/// touch, including calls that never got a result, are left alone.
+fn tool_call_pair_message_ids_to_remove(
+    task_source: &api::Task,
+    removed_ids: &HashSet<MessageId>,
+) -> HashSet<MessageId> {
+    // tool_call_id -> ids of the call message and of its result messages
+    let mut pair_message_ids: HashMap<&str, Vec<&str>> = HashMap::new();
+    for message in &task_source.messages {
+        let tool_call_id = message
+            .tool_call()
+            .map(|tool_call| tool_call.tool_call_id.as_str())
+            .or_else(|| {
+                message
+                    .tool_call_result()
+                    .map(|result| result.tool_call_id.as_str())
+            });
+        if let Some(tool_call_id) = tool_call_id.filter(|id| !id.is_empty()) {
+            pair_message_ids
+                .entry(tool_call_id)
+                .or_default()
+                .push(message.id.as_str());
+        }
+    }
+
+    pair_message_ids
+        .into_values()
+        .filter(|message_ids| {
+            message_ids
+                .iter()
+                .any(|id| removed_ids.contains(&MessageId::new((*id).to_owned())))
+        })
+        .flatten()
+        .map(|id| MessageId::new(id.to_owned()))
+        .collect()
 }
 
 pub(super) fn update_todo_list_from_todo_op(
