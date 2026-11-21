@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Jeremy Chone
+// SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
+// SPDX-License-Identifier: (MIT OR Apache-2.0) AND AGPL-3.0-only
+// Modified by Tianyu (Sky) Lu in 2026: read why a response is incomplete.
+
 use crate::adapter::openai_resp::resp_types::RespUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +24,9 @@ pub struct RespResponse {
 
 	/// {code: String, message: string}
 	pub error: Option<Value>,
+
+	/// {reason: String}: why the response is incomplete (`max_output_tokens`, `content_filter`).
+	pub incomplete_details: Option<Value>,
 
 	/// An upper bound for the number of tokens that can be generated for a response, including visible output tokens and reasoning tokens.
 	pub max_output_tokens: Option<i64>,

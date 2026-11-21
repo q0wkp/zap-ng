@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Jeremy Chone
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: (MIT OR Apache-2.0) AND AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: captured reasoning items whole, so that they can be sent back.
+// Modified by Tianyu (Sky) Lu in 2026: captured reasoning items whole, so that they can be sent back; ended the stream with an error on error events and incomplete responses.
 
 use super::adapter_impl::reasoning_item_signature;
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
@@ -11,7 +11,7 @@ use crate::chat::{ChatOptionsSet, StopReason, ToolCall};
 use crate::webc::{Event, EventSourceStream};
 use crate::{Error, ModelIden, Result};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -102,8 +102,98 @@ enum RespStreamEvent {
 	#[serde(rename = "response.incomplete")]
 	ResponseIncomplete { response: RespResponse },
 
+	/// A top-level error event (rate limit, server error, refused request): the response ends
+	/// here. Some servers put the details in an `error` object instead of the event itself.
+	#[serde(rename = "error")]
+	Error {
+		#[serde(default)]
+		code: Option<Value>,
+		#[serde(default)]
+		message: Option<String>,
+		#[serde(default)]
+		error: Option<Value>,
+	},
+
 	#[serde(other)]
 	Unknown,
+}
+
+/// The error a stream ends with when its response does not complete, carrying the event, the
+/// response id, the error code and the message, so that it shows as a failed request rather
+/// than as an empty or cut-off answer.
+fn terminal_error(
+	model_iden: &ModelIden,
+	event: &str,
+	response_id: Option<&str>,
+	code: Option<&str>,
+	message: &str,
+) -> Error {
+	Error::ChatResponse {
+		model_iden: model_iden.clone(),
+		body: json!({
+			"event": event,
+			"response_id": response_id,
+			"code": code,
+			"message": message,
+		}),
+	}
+}
+
+/// A code or message field as text: codes come as strings, sometimes as numbers.
+fn field_text(value: Option<&Value>) -> Option<String> {
+	match value? {
+		Value::String(text) if !text.is_empty() => Some(text.clone()),
+		Value::Number(number) => Some(number.to_string()),
+		_ => None,
+	}
+}
+
+/// The error of a top-level `error` event.
+fn error_event_error(
+	model_iden: &ModelIden,
+	code: Option<&Value>,
+	message: Option<&str>,
+	error: Option<&Value>,
+) -> Error {
+	let code = field_text(code).or_else(|| field_text(error.and_then(|e| e.get("code"))));
+	let message = message
+		.filter(|m| !m.is_empty())
+		.map(str::to_string)
+		.or_else(|| field_text(error.and_then(|e| e.get("message"))))
+		.unwrap_or_else(|| "the provider sent an error event without a message".to_string());
+	let response_id = error.and_then(|e| e.get("response_id")).and_then(Value::as_str);
+	terminal_error(model_iden, "error", response_id, code.as_deref(), &message)
+}
+
+/// The error of a `response.failed` event.
+fn failed_response_error(model_iden: &ModelIden, response: &RespResponse) -> Error {
+	let error = response.error.as_ref();
+	let code = field_text(error.and_then(|e| e.get("code")));
+	let message = field_text(error.and_then(|e| e.get("message"))).unwrap_or_else(|| "the response failed".to_string());
+	terminal_error(
+		model_iden,
+		"response.failed",
+		Some(&response.id),
+		code.as_deref(),
+		&message,
+	)
+}
+
+/// The error of a `response.incomplete` event: the answer was cut off (the output token limit,
+/// the content filter), so it is not passed off as a complete one.
+fn incomplete_response_error(model_iden: &ModelIden, response: &RespResponse) -> Error {
+	let reason = field_text(response.incomplete_details.as_ref().and_then(|d| d.get("reason")));
+	let message = match &reason {
+		Some(reason) => format!("the response is incomplete: {reason}"),
+		None => "the response is incomplete".to_string(),
+	};
+	terminal_error(
+		model_iden,
+		"response.incomplete",
+		Some(&response.id),
+		reason.as_deref(),
+		&message,
+	)
 }
 
 impl OpenAIRespStreamer {
@@ -263,35 +353,25 @@ impl futures::Stream for OpenAIRespStreamer {
 
 						RespStreamEvent::ResponseFailed { response } => {
 							self.done = true;
-							let error_msg = response
-								.error
-								.as_ref()
-								.and_then(|e| e.x_get_str("message").ok())
-								.unwrap_or("OpenAI Response Failed");
-
-							return Poll::Ready(Some(Err(Error::StreamParse {
-								model_iden: self.options.model_iden.clone(),
-								serde_error: serde::de::Error::custom(error_msg),
-							})));
+							let error = failed_response_error(&self.options.model_iden, &response);
+							return Poll::Ready(Some(Err(error)));
 						}
 
 						RespStreamEvent::ResponseIncomplete { response } => {
 							self.done = true;
-							self.captured_data.stop_reason = Some(response.status.clone());
-							// For incomplete, we might still want to return what we have?
-							// But for now, let's treat it as a successful end but with whatever we captured.
-							let resp_id = response.id.clone();
-							let inter_stream_end = InterStreamEnd {
-								captured_usage: response.usage.map(Into::into),
-								captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-								captured_text_content: self.captured_data.content.take(),
-								captured_reasoning_content: self.captured_data.reasoning_content.take(),
-								captured_tool_calls: self.captured_data.tool_calls.take(),
-								captured_thought_signatures: None,
-								captured_response_id: Some(resp_id),
-							};
+							let error = incomplete_response_error(&self.options.model_iden, &response);
+							return Poll::Ready(Some(Err(error)));
+						}
 
-							return Poll::Ready(Some(Ok(InterStreamEvent::End(inter_stream_end))));
+						RespStreamEvent::Error { code, message, error } => {
+							self.done = true;
+							let error = error_event_error(
+								&self.options.model_iden,
+								code.as_ref(),
+								message.as_deref(),
+								error.as_ref(),
+							);
+							return Poll::Ready(Some(Err(error)));
 						}
 
 						RespStreamEvent::Unknown => {
@@ -329,3 +409,7 @@ impl futures::Stream for OpenAIRespStreamer {
 		Poll::Pending
 	}
 }
+
+#[cfg(test)]
+#[path = "streamer_tests.rs"]
+mod tests;
