@@ -14,6 +14,7 @@ use std::{
     ops::DerefMut,
     sync::Arc,
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use log::error;
@@ -360,22 +361,28 @@ where
                 let mut child_exited = false;
 
                 'event_loop: loop {
-                    // Clear the events so that we can reliably equate the absence of events
-                    // to the timeout being fired.
-                    events.clear();
-
-                    // Wait for events, but only up to the remaining timeout for the synchronous output
-                    // update (if any).
-                    let sync_state_timeout = state.parser.sync_output_remaining_timeout();
-                    if let Err(err) = self.poll.poll(&mut events, sync_state_timeout) {
+                    // While readiness is left over from an earlier batch, only check for new
+                    // events without blocking. Otherwise wait for events, but only up to the
+                    // remaining timeout for the synchronous output update (if any).
+                    let timeout = if can_read || (state.needs_write() && can_write) {
+                        Some(Duration::ZERO)
+                    } else {
+                        state.parser.sync_output_remaining_timeout()
+                    };
+                    if let Err(err) = self.poll.poll(&mut events, timeout) {
                         match err.kind() {
                             ErrorKind::Interrupted => continue,
                             _ => panic!("EventLoop polling error: {err:?}"),
                         }
                     }
 
-                    // If there were no events but `poll` returned, that means we hit the timeout.
-                    if events.is_empty() {
+                    // Flush the synchronized output once its time is up, whether or not
+                    // events arrived meanwhile.
+                    if state
+                        .parser
+                        .sync_output_remaining_timeout()
+                        .is_some_and(|remaining| remaining.is_zero())
+                    {
                         let mut terminal_response_sequences = Vec::new();
                         state.parser.finish_sync_output(
                             &mut *self.terminal.lock(),
@@ -429,36 +436,34 @@ where
                         }
                     }
 
-                    // As long as we have work to do, do it.  Once we need to
-                    // wait on some readiness (pty readability, pty writability,
-                    // or new data to write), go back to the start of the event
-                    // loop.
-                    while can_read || (state.needs_write() && can_write) {
-                        if can_read {
-                            match self.pty_read(&mut state, &mut buf, &mut can_read) {
-                                Ok(_) => {}
-                                Err(err) => {
-                                    // On Linux, a `read` on the master side of a PTY can fail
-                                    // with `EIO` if the client side hangs up.  In that case,
-                                    // just loop back round for the inevitable `Exited` event.
-                                    // This sucks, but checking the process is either racy or
-                                    // blocking.
-                                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                                    if err.kind() == ErrorKind::Other {
-                                        continue;
-                                    }
-
-                                    error!("Error reading from PTY in event loop: {err}");
-                                    break 'event_loop;
+                    // Do one batch of reads and writes, then go back to `poll`, so that
+                    // channel messages (input, resizes, shutdown) and new readiness events are
+                    // handled between batches even while the PTY never runs dry.
+                    if can_read {
+                        match self.pty_read(&mut state, &mut buf, &mut can_read) {
+                            Ok(_) => {}
+                            Err(err) => {
+                                // On Linux, a `read` on the master side of a PTY can fail
+                                // with `EIO` if the client side hangs up.  In that case,
+                                // just wait in `poll` for the inevitable `Exited` event.
+                                // This sucks, but checking the process is either racy or
+                                // blocking.
+                                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                                if err.kind() == ErrorKind::Other {
+                                    can_read = false;
+                                    continue;
                                 }
-                            }
-                        }
 
-                        if state.needs_write() && can_write {
-                            if let Err(err) = self.pty_write(&mut state, &mut can_write) {
-                                error!("Error writing to PTY in event loop: {err}");
+                                error!("Error reading from PTY in event loop: {err}");
                                 break 'event_loop;
                             }
+                        }
+                    }
+
+                    if state.needs_write() && can_write {
+                        if let Err(err) = self.pty_write(&mut state, &mut can_write) {
+                            error!("Error writing to PTY in event loop: {err}");
+                            break 'event_loop;
                         }
                     }
                 }
@@ -480,3 +485,7 @@ where
             .expect("thread spawn works")
     }
 }
+
+#[cfg(test)]
+#[path = "event_loop_tests.rs"]
+mod tests;

@@ -15,18 +15,24 @@ use std::sync::Arc;
 
 use parking_lot::FairMutex;
 use zap_ng_ui::r#async::executor::Background;
-use zap_ng_ui::{App, EntityId, ModelHandle};
+use zap_ng_ui::{App, EntityId, ModelHandle, SingletonEntity};
 
 use super::{BlocklistAIContextModel, PendingAttachment, PendingFile};
 use crate::ai::agent::{AIAgentAttachment, ImageContext};
 use crate::ai::blocklist::agent_view::{AgentViewController, EphemeralMessageModel};
+use crate::ai::blocklist::{InputConfig, InputType};
 use crate::cloud_object::model::persistence::ObjectStoreModel;
 use crate::cloud_object::update_manager::UpdateManager;
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext,
+    CLIAgentSessionStatus, CLIAgentSessionsModel,
+};
 use crate::terminal::color::{self, Colors};
 use crate::terminal::event_listener::ChannelEventListener;
 use crate::terminal::model::test_utils::block_size;
 use crate::terminal::model::{BlockId, TerminalModel};
 use crate::terminal::view::ambient_agent::AmbientAgentViewModel;
+use crate::terminal::CLIAgent;
 
 impl BlocklistAIContextModel {
     pub(crate) fn append_pending_attachments_for_test(
@@ -239,6 +245,85 @@ fn retain_at_context_attachments_in_query_drops_deleted_prefix_reference() {
             assert!(m
                 .pending_at_context_attachments()
                 .contains_key("@commit (4)"));
+        });
+    });
+}
+
+/// Opens a CLI agent's rich input on the terminal the context model belongs to.
+fn open_cli_agent_rich_input(app: &mut App, model: &ModelHandle<BlocklistAIContextModel>) {
+    let terminal_view_id = model.read(&*app, |m, _| m.terminal_view_id);
+    CLIAgentSessionsModel::handle(&*app).update(app, |sessions, ctx| {
+        sessions.set_session(
+            terminal_view_id,
+            CLIAgentSession {
+                agent: CLIAgent::Claude,
+                status: CLIAgentSessionStatus::InProgress,
+                session_context: CLIAgentSessionContext::default(),
+                input_state: CLIAgentInputState::Closed,
+                should_auto_toggle_input: false,
+                listener: None,
+                remote_host: None,
+                plugin_version: None,
+                draft_text: None,
+                custom_command_prefix: None,
+            },
+            ctx,
+        );
+        sessions.open_input(
+            terminal_view_id,
+            CLIAgentInputEntrypoint::CtrlG,
+            InputConfig {
+                input_type: InputType::AI,
+                is_locked: true,
+            },
+            false,
+            false,
+            ctx,
+        );
+    });
+}
+
+#[test]
+fn agent_model_without_vision_keeps_images_of_open_cli_agent_rich_input() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let model = build_test_context_model(&mut app);
+        open_cli_agent_rich_input(&mut app, &model);
+
+        model.update(&mut app, |m, ctx| {
+            m.append_pending_attachments_for_test(vec![
+                make_image_attachment("a.png"),
+                make_file_attachment("notes.txt"),
+            ]);
+            // The images are pasted into the CLI agent, so a switch to a model without vision
+            // (also in another pane) leaves them alone.
+            m.handle_active_agent_model_changed(false, ctx);
+        });
+
+        model.read(&app, |m, _| {
+            assert_eq!(m.pending_images().len(), 1);
+            assert_eq!(m.pending_files().len(), 1);
+        });
+    });
+}
+
+#[test]
+fn agent_model_without_vision_drops_images_but_keeps_files() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let model = build_test_context_model(&mut app);
+
+        model.update(&mut app, |m, ctx| {
+            m.append_pending_attachments_for_test(vec![
+                make_image_attachment("a.png"),
+                make_file_attachment("notes.txt"),
+            ]);
+            m.handle_active_agent_model_changed(false, ctx);
+        });
+
+        model.read(&app, |m, _| {
+            assert!(m.pending_images().is_empty());
+            assert_eq!(m.pending_files().len(), 1);
         });
     });
 }
