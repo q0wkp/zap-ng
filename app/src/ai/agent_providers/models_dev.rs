@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: built a copy of the models.dev catalog into the binary with a configurable URL and download switch, and made catalog models enabled by default; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: built a copy of the models.dev catalog into the binary with a configurable URL and download switch, made catalog models enabled by default, and added a lookup of a model's token limits; renamed the Warp and Zap names to ZapNG.
 
 //! models.dev 数据源接入。
 //!
@@ -296,6 +296,18 @@ pub fn lookup_caps(provider_id: &str, model_id: &str) -> Option<ModelCaps> {
         }
     }
     None
+}
+
+/// The context window and output limit (in tokens, 0 for unknown) the loaded catalog lists for
+/// a model, looked up as [`lookup_caps`] does.
+pub fn lookup_limit(provider_id: &str, model_id: &str) -> Option<(u32, u32)> {
+    let s = state().read().ok()?;
+    let catalog = s.catalog.as_ref()?;
+    let model = catalog
+        .get(provider_id)
+        .and_then(|p| p.models.get(model_id))
+        .or_else(|| catalog.values().find_map(|p| p.models.get(model_id)))?;
+    Some((model.limit.context, model.limit.output))
 }
 
 /// 把磁盘缓存读进内存。

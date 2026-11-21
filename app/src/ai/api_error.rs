@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: made a rejected BYOP summary final rather than retried; renamed the Warp and Zap names to ZapNG.
 
 use crate::ai::byop_readiness::BlockedByopReadinessError;
 use anyhow::anyhow;
@@ -168,7 +168,13 @@ impl AIApiError {
             | AIApiError::Deserialization(_)
             | AIApiError::NoContextFound
             | AIApiError::Stream { .. } => true,
-            AIApiError::Other(error) => error.downcast_ref::<BlockedByopReadinessError>().is_none(),
+            AIApiError::Other(error) => {
+                error.downcast_ref::<BlockedByopReadinessError>().is_none()
+                    && error
+                        .downcast_ref::<crate::ai::byop_compaction::commit::IncompleteSummaryError>(
+                        )
+                        .is_none()
+            }
         }
     }
 }
@@ -183,6 +189,15 @@ mod tests {
         let error = AIApiError::Other(
             BlockedByopReadinessError::new(ReadinessCategory::MissingResultWithoutRepairSource)
                 .into(),
+        );
+
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn byop_incomplete_summary_error_is_not_retryable() {
+        let error = AIApiError::Other(
+            crate::ai::byop_compaction::commit::IncompleteSummaryError::new("it is empty").into(),
         );
 
         assert!(!error.is_retryable());

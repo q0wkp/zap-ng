@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: passed the task id to the title-generation call so the request inspector can group it; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: passed the task id to the title-generation call so the request inspector can group it, and made BYOP auto-compaction fire on the provider's reported usage or the size of the request about to be sent, against the model's own window; renamed the Warp and Zap names to ZapNG.
 
 //! This module contains core business logic for Agent Mode, primarily sending input to an AI
 //! model and receiving output.
@@ -394,6 +394,16 @@ pub struct BlocklistAIController {
     /// 避免用户提交的 prompt 被静默丢弃。
     /// 每个 conversation 最多保留 1 条;用户后续直接提交新请求会覆盖。
     pending_byop_requests: HashMap<AIConversationId, PendingByopRequest>,
+    /// BYOP auto-compaction: requests held back while the summary stream (the id beside each)
+    /// that makes room for them runs. Sent once that stream ends, dropped if it is cancelled.
+    byop_requests_awaiting_compaction:
+        HashMap<AIConversationId, (ResponseStreamId, PendingByopRequest)>,
+    /// Conversations whose next request is the resend of a request held back for compaction,
+    /// which is not checked for compaction again.
+    byop_compaction_resends: HashSet<AIConversationId>,
+    /// Streams whose turn ended over the auto-compaction threshold: once a stream ends with no
+    /// tool call left to run, its conversation is summarized.
+    byop_auto_compaction_due: HashSet<ResponseStreamId>,
 }
 
 /// 见 `pending_byop_requests`。
@@ -628,6 +638,9 @@ impl BlocklistAIController {
             pending_passive_follow_ups: HashSet::new(),
             pending_passive_suggestion_results: HashMap::new(),
             pending_byop_requests: HashMap::new(),
+            byop_requests_awaiting_compaction: HashMap::new(),
+            byop_compaction_resends: HashSet::new(),
+            byop_auto_compaction_due: HashSet::new(),
         }
     }
 
@@ -1582,6 +1595,142 @@ impl BlocklistAIController {
         true
     }
 
+    /// Whether the BYOP request `request_params` would come near the model's window (see
+    /// [`crate::ai::byop_compaction::overflow::needs_auto_compaction`]), going by a rough count of
+    /// the request as it will be sent, so that gateways that report no usage are covered too, and
+    /// whether its history has anything left to summarize.
+    fn should_compact_before_sending(
+        &self,
+        request_params: &api::RequestParams,
+        ctx: &ModelContext<Self>,
+    ) -> bool {
+        if request_params.input.iter().any(|input| {
+            matches!(input, AIAgentInput::SummarizeConversation { .. })
+                || input.is_passive_request()
+        }) {
+            return false;
+        }
+        let Some(limit) = request_params.compaction_limit else {
+            return false;
+        };
+        let cfg = request_params.compaction_config.clone().unwrap_or_default();
+        if !cfg.auto {
+            return false;
+        }
+        let Some(tokens) =
+            crate::ai::agent_providers::estimate_byop_request_tokens(ctx, request_params)
+        else {
+            return false;
+        };
+        if !crate::ai::byop_compaction::overflow::needs_auto_compaction(&cfg, tokens, limit) {
+            return false;
+        }
+        if !crate::ai::agent_providers::chat_stream::has_summarizable_history(request_params) {
+            log::info!(
+                "[byop-compaction] request of ~{tokens} tokens is over the threshold, but there \
+                 is nothing left to summarize"
+            );
+            return false;
+        }
+        log::info!(
+            "[byop-compaction] request of ~{tokens} tokens is over the threshold {} \
+             (window {}): summarizing first",
+            crate::ai::byop_compaction::overflow::auto_compaction_threshold(&cfg, limit),
+            limit.context
+        );
+        true
+    }
+
+    /// Sends an automatic summary request for `conversation_id`, as `/compact` would but without
+    /// touching the input buffer or the selected conversation.
+    fn send_byop_compaction(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) -> anyhow::Result<(AIConversationId, ResponseStreamId)> {
+        let Some(conversation) =
+            BlocklistAIHistoryModel::as_ref(ctx).conversation(&conversation_id)
+        else {
+            return Err(anyhow!("conversation {conversation_id:?} not found"));
+        };
+        let root_task_id = conversation.get_root_task_id().clone();
+        let request_input = RequestInput::for_task(
+            vec![AIAgentInput::SummarizeConversation {
+                prompt: None,
+                overflow: true,
+            }],
+            root_task_id,
+            &self.active_session,
+            self.get_current_response_initiator(),
+            conversation_id,
+            self.terminal_view_id,
+            ctx,
+        );
+        self.send_request_input(
+            request_input,
+            None,
+            /*default_to_follow_up_on_success*/ false,
+            /*can_attempt_resume_on_error*/ false,
+            /*is_queued_prompt*/ true,
+            ctx,
+        )
+    }
+
+    /// Sends the request held back for the summary stream `stream_id`, now that it has ended,
+    /// or drops it when that stream was cancelled. A summary that failed leaves the history as
+    /// it was, and the request then goes out unchanged.
+    fn send_request_awaiting_compaction(
+        &mut self,
+        conversation_id: AIConversationId,
+        stream_id: &ResponseStreamId,
+        was_cancelled: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !self
+            .byop_requests_awaiting_compaction
+            .get(&conversation_id)
+            .is_some_and(|(summary_stream_id, _)| summary_stream_id == stream_id)
+        {
+            return;
+        }
+        let Some((_, pending)) = self
+            .byop_requests_awaiting_compaction
+            .remove(&conversation_id)
+        else {
+            return;
+        };
+        if was_cancelled {
+            log::info!(
+                "[byop-compaction] summary cancelled: the request waiting for it is not sent \
+                 conversation_id={conversation_id:?}"
+            );
+            return;
+        }
+        let PendingByopRequest {
+            request_input,
+            query_metadata,
+            default_to_follow_up_on_success,
+            can_attempt_resume_on_error,
+            is_queued_prompt,
+        } = pending;
+        self.byop_compaction_resends.insert(conversation_id);
+        if let Err(e) = self.send_request_input(
+            request_input,
+            query_metadata,
+            default_to_follow_up_on_success,
+            can_attempt_resume_on_error,
+            is_queued_prompt,
+            ctx,
+        ) {
+            if e.downcast_ref::<PendingByopToolResultsError>().is_none() {
+                log::error!(
+                    "[byop-compaction] failed to send the request after the summary: {e:?}"
+                );
+            }
+        }
+        self.byop_compaction_resends.remove(&conversation_id);
+    }
+
     pub fn resume_conversation(
         &mut self,
         conversation_id: AIConversationId,
@@ -1974,6 +2123,12 @@ impl BlocklistAIController {
             request_params.compaction_state = Some(convo.compaction_state.clone());
             request_params.byop_repair_state = convo.byop_repair_state.clone();
         }
+        request_params.compaction_limit = crate::ai::agent_providers::byop_model_limit(
+            ctx,
+            &request_params.model,
+            request_params.context_window_limit,
+        );
+        request_params.compaction_config = Some(compaction_cfg);
 
         self.populate_lrc_request_params(&mut request_params, conversation_id);
         request_params
@@ -2866,6 +3021,7 @@ impl BlocklistAIController {
         // 新一轮请求开始,先丢掉之前因 readiness Pending 暂存的旧请求;
         // 如果本次 preflight 又遇到 PendingToolResults,下面会重新写回。
         self.pending_byop_requests.remove(&conversation_id);
+        let is_compaction_resend = self.byop_compaction_resends.remove(&conversation_id);
 
         // Make sure there's no existing response stream for the conversation. If
         // there is, something has gone wrong.
@@ -2998,6 +3154,34 @@ impl BlocklistAIController {
                 }
             }
             return Err(error);
+        }
+
+        // A request that would overflow the model's window waits for a summary of the history
+        // first, and is sent once that summary stream ends.
+        if !is_compaction_resend && self.should_compact_before_sending(&request_params, ctx) {
+            match self.send_byop_compaction(conversation_id, ctx) {
+                Ok((summary_conversation_id, summary_stream_id)) => {
+                    self.byop_requests_awaiting_compaction.insert(
+                        conversation_id,
+                        (
+                            summary_stream_id.clone(),
+                            PendingByopRequest {
+                                request_input,
+                                query_metadata,
+                                default_to_follow_up_on_success,
+                                can_attempt_resume_on_error,
+                                is_queued_prompt,
+                            },
+                        ),
+                    );
+                    return Ok((summary_conversation_id, summary_stream_id));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[byop-compaction] could not summarize before sending, sending as is: {e:?}"
+                    );
+                }
+            }
         }
 
         let server_conversation_token_for_identifiers =
@@ -3349,12 +3533,20 @@ impl BlocklistAIController {
                                 // ZapNG BYOP 本地会话压缩:在 stream finished 前拿 summarization 标志
                                 let summarize_overflow =
                                     response_stream.as_ref(ctx).summarization_overflow();
+                                let summary_source = summarize_overflow.map(|_| {
+                                    crate::ai::agent_providers::chat_stream::summary_source(
+                                        response_stream.as_ref(ctx).params(),
+                                    )
+                                });
+                                let compaction_limit =
+                                    response_stream.as_ref(ctx).params().compaction_limit;
                                 self.handle_response_stream_finished(
                                     &stream_id,
                                     finished_event,
                                     conversation_id,
                                     did_input_contain_user_query,
-                                    summarize_overflow,
+                                    summarize_overflow.zip(summary_source),
+                                    compaction_limit,
                                     ctx,
                                 );
                             }
@@ -3465,6 +3657,7 @@ impl BlocklistAIController {
                     }
                 }
 
+                let queued_actions = !actions_to_queue.is_empty();
                 if let Some(stream_cancellation) = &cancellation {
                     history_model.update(ctx, |history_model, ctx| {
                         history_model.mark_response_stream_cancelled(
@@ -3635,9 +3828,34 @@ impl BlocklistAIController {
                     });
                 }
                 ctx.emit(BlocklistAIControllerEvent::FinishedReceivingOutput {
-                    stream_id,
+                    stream_id: stream_id.clone(),
                     conversation_id,
                 });
+
+                // ZapNG BYOP auto-compaction: summarize a conversation whose turn ended over the
+                // threshold once nothing of that turn is left to run, and send a request that
+                // waited for a summary stream once that stream has ended.
+                if self.byop_auto_compaction_due.remove(&stream_id)
+                    && cancellation.is_none()
+                    && !queued_actions
+                    && !self
+                        .pending_auto_resume_handles
+                        .contains_key(&conversation_id)
+                    && !self
+                        .action_model
+                        .as_ref(ctx)
+                        .has_unfinished_actions_for_conversation(conversation_id)
+                {
+                    if let Err(e) = self.send_byop_compaction(conversation_id, ctx) {
+                        log::warn!("[byop-compaction] could not start the summary: {e:?}");
+                    }
+                }
+                self.send_request_awaiting_compaction(
+                    conversation_id,
+                    &stream_id,
+                    cancellation.is_some(),
+                    ctx,
+                );
                 // ZapNG(Phase 3c A1):删除
                 // `AIRequestUsageModel::refresh_request_usage_async` 与
                 // `maybe_refresh_ai_overages` 调用。两者本质都是服务端计量同步 RPC，
@@ -3674,15 +3892,17 @@ impl BlocklistAIController {
         mut finished_event: warp_multi_agent_api::response_event::StreamFinished,
         conversation_id: AIConversationId,
         did_request_contain_user_query: bool,
-        summarize_overflow: Option<bool>,
+        summary: Option<(bool, crate::ai::byop_compaction::commit::SummarySource)>,
+        compaction_limit: Option<crate::ai::byop_compaction::overflow::ModelLimit>,
         ctx: &mut ModelContext<Self>,
     ) {
         // ZapNG BYOP 本地会话压缩:在 token_usage move 进下面 closure 前先聚合,
-        // 用于 auto overflow 检查(后面 Done 分支用)。
+        // 用于 auto overflow 检查(后面 Done 分支用)。The input count already includes the
+        // cached tokens, so they are not added again.
         let aggregate_token_count: usize = finished_event
             .token_usage
             .iter()
-            .map(|u| (u.total_input + u.output + u.input_cache_read + u.input_cache_write) as usize)
+            .map(|u| u.total_input as usize + u.output as usize)
             .max()
             .unwrap_or(0);
 
@@ -3705,14 +3925,12 @@ impl BlocklistAIController {
         match finished_event.reason {
             Some(warp_multi_agent_api::response_event::stream_finished::Reason::Done(_)) | None => {
                 // ZapNG BYOP 本地会话压缩 - 写回 summary
-                if let Some(overflow) = summarize_overflow {
-                    let compaction_cfg = crate::ai::byop_compaction::CompactionConfig::from_settings(ctx);
+                let is_summary_stream = summary.is_some();
+                if let Some((overflow, source)) = summary {
                     history_model.update(ctx, |history_model, _ctx| {
                         if let Some(convo) = history_model.conversation_mut(&conversation_id) {
                             crate::ai::byop_compaction::commit::commit_summarization(
-                                convo,
-                                overflow,
-                                &compaction_cfg,
+                                convo, overflow, &source,
                             );
                         }
                     });
@@ -3727,32 +3945,26 @@ impl BlocklistAIController {
                 });
 
                 // ZapNG BYOP 本地会话压缩 - auto overflow 触发(对齐 opencode `processor.ts:395-403`)
-                // 仅在本流不是摘要本身时检查,防止递归。
-                if summarize_overflow.is_none() {
-                    let aggregate_count = aggregate_token_count;
-                    if aggregate_count > 0 {
+                // 仅在本流不是摘要本身时检查,防止递归。The summary is sent once the stream
+                // has ended with no tool call left to run (see `AfterStreamFinished`), since a
+                // turn's tool calls are queued only then.
+                if !is_summary_stream {
+                    if let Some(model_limit) = compaction_limit {
                         let cfg = crate::ai::byop_compaction::CompactionConfig::from_settings(ctx);
-                        let model_limit =
-                            crate::ai::byop_compaction::overflow::ModelLimit::FALLBACK;
-                        let counts = crate::ai::byop_compaction::overflow::TokenCounts {
-                            total: aggregate_count,
-                            ..Default::default()
-                        };
-                        if crate::ai::byop_compaction::is_overflow(&cfg, counts, model_limit) {
+                        if crate::ai::byop_compaction::overflow::needs_auto_compaction(
+                            &cfg,
+                            aggregate_token_count,
+                            model_limit,
+                        ) {
                             log::info!(
-                                "[byop-compaction] auto overflow detected: tokens={aggregate_count} usable={}",
-                                crate::ai::byop_compaction::usable(&cfg, model_limit)
+                                "[byop-compaction] auto overflow detected: tokens={aggregate_token_count} threshold={} window={}",
+                                crate::ai::byop_compaction::overflow::auto_compaction_threshold(
+                                    &cfg,
+                                    model_limit
+                                ),
+                                model_limit.context
                             );
-                            // 通过 SlashCommandRequest::Summarize 触发(与 /compact-and 同链路);
-                            // overflow=true → chat_stream 拼摘要请求时携带 overflow 标记,
-                            // commit_summarization 写回时也以 overflow=true 落 state(便于 UI 区分)。
-                            self.send_slash_command_request(
-                                crate::ai::blocklist::controller::SlashCommandRequest::Summarize {
-                                    prompt: None,
-                                    overflow: true,
-                                },
-                                ctx,
-                            );
+                            self.byop_auto_compaction_due.insert(stream_id.clone());
                         }
                     }
                 }

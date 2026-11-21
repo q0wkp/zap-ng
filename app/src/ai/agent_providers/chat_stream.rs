@@ -1228,6 +1228,122 @@ fn build_outbound_chat_request(
     Ok(chat_req)
 }
 
+/// Where a summary request cuts the history `all_msgs` (in the order `build_chat_request` sends
+/// it): the messages before the returned index are summarized, the rest is kept as it is. Sized
+/// with the request's own compaction settings and model limit, so that the commit of the summary
+/// ([`summary_source`]) hides exactly what was summarized.
+fn summarization_head_end(params: &RequestParams, all_msgs: &[&api::Message]) -> usize {
+    let state = params.compaction_state.clone().unwrap_or_default();
+    let tool_names =
+        byop_compaction::message_view::build_tool_name_lookup(all_msgs.iter().copied());
+    let views = byop_compaction::message_view::project(all_msgs, &state, &tool_names);
+    let cfg = params.compaction_config.clone().unwrap_or_default();
+    let model_limit = params
+        .compaction_limit
+        .unwrap_or(byop_compaction::overflow::ModelLimit::FALLBACK);
+    let result = byop_compaction::algorithm::select(&views, &cfg, model_limit, |slice| {
+        slice
+            .iter()
+            .map(byop_compaction::algorithm::MessageRef::estimate_size)
+            .sum()
+    });
+    result.head_end.min(all_msgs.len())
+}
+
+/// What a summary request built from `params` summarizes, for the commit of its summary: the
+/// messages before its cut, in the order they were sent, and every message of its history.
+pub(crate) fn summary_source(params: &RequestParams) -> byop_compaction::commit::SummarySource {
+    let all_msgs = collect_linearized_task_messages(&params.tasks);
+    let head_end = summarization_head_end(params, &all_msgs);
+    byop_compaction::commit::SummarySource {
+        head_message_ids: all_msgs[..head_end].iter().map(|m| m.id.clone()).collect(),
+        history_message_ids: params
+            .tasks
+            .iter()
+            .flat_map(|task| task.messages.iter())
+            .map(|m| m.id.clone())
+            .collect(),
+        completed_compactions: params
+            .compaction_state
+            .as_ref()
+            .map_or(0, |state| state.completed().len()),
+    }
+}
+
+/// Whether a summary request built from `params` would summarize anything not already covered
+/// by an earlier summary.
+pub(crate) fn has_summarizable_history(params: &RequestParams) -> bool {
+    let hidden = params
+        .compaction_state
+        .as_ref()
+        .map(|state| state.hidden_message_ids())
+        .unwrap_or_default();
+    summary_source(params)
+        .head_message_ids
+        .iter()
+        .any(|id| !hidden.contains(id))
+}
+
+/// Bytes of request taken for one token when sizing a request before it is sent. Text runs from
+/// about 4 bytes a token (English prose) to under 2 (code, JSON, CJK); 2 errs on the large side,
+/// so that a gateway that reports no usage is compacted before it overflows, not after.
+const ESTIMATE_BYTES_PER_TOKEN: usize = 2;
+/// What an image or other binary attachment is taken to cost, in bytes of estimate.
+const ESTIMATE_BINARY_PART_BYTES: usize = 3_000;
+
+/// A rough token count of `req` as it will be sent: its system prompt, every message's text,
+/// reasoning, tool calls and tool results, and the tool definitions.
+pub(crate) fn estimate_chat_request_tokens(req: &ChatRequest) -> usize {
+    let mut bytes = req.system.as_ref().map_or(0, String::len);
+    for msg in &req.messages {
+        for part in msg.content.parts() {
+            bytes += match part {
+                ContentPart::Text(text) | ContentPart::ReasoningContent(text) => text.len(),
+                ContentPart::ToolCall(call) => {
+                    call.fn_name.len() + call.fn_arguments.to_string().len()
+                }
+                ContentPart::ToolResponse(response) => response.content.len(),
+                ContentPart::Binary(_) => ESTIMATE_BINARY_PART_BYTES,
+                ContentPart::ThoughtSignature(_) | ContentPart::Custom(_) => 0,
+            };
+        }
+    }
+    if let Some(tools) = req.tools.as_ref() {
+        bytes += serde_json::to_string(tools).map_or(0, |json| json.len());
+    }
+    bytes.div_ceil(ESTIMATE_BYTES_PER_TOKEN)
+}
+
+/// A rough token count of the request `generate_byop_output` would send for `params` (see
+/// [`estimate_chat_request_tokens`]), or `None` when it can't be built.
+pub(crate) fn estimate_request_tokens(
+    params: &RequestParams,
+    api_type: AgentProviderApiType,
+    model_id: &str,
+    base_url: &str,
+    attachment_caps: attachment_caps::AttachmentCaps,
+) -> Option<usize> {
+    let force_echo_reasoning = super::reasoning::model_requires_reasoning_echo(api_type, model_id);
+    let shaping_api_type =
+        if effective_adapter_kind_for(api_type, model_id, base_url) == AdapterKind::Anthropic {
+            AgentProviderApiType::Anthropic
+        } else {
+            api_type
+        };
+    let reasoning_scope = (effective_adapter_kind_for(api_type, model_id, base_url)
+        == AdapterKind::OpenAIResp)
+        .then(|| ReasoningScope::new(&normalize_endpoint_url(api_type, base_url), model_id));
+    let chat_req = build_chat_request(
+        params,
+        force_echo_reasoning,
+        shaping_api_type,
+        attachment_caps,
+        reasoning_scope.as_ref(),
+    )
+    .ok()?;
+    Some(estimate_chat_request_tokens(&chat_req))
+}
+
 /// 把 RequestParams 翻译为 genai `ChatRequest`(含 system + messages + tools)。
 ///
 /// `force_echo_reasoning`:由 `super::reasoning::model_requires_reasoning_echo`
@@ -1340,22 +1456,7 @@ fn build_chat_request(
 
     // 摘要请求路径:用 byop_compaction::algorithm::select 切 head;tail 不送上游
     let summarize_head_end: Option<usize> = if is_summarization_request {
-        // 临时投影成 ZapNGMessageView 算 select
-        let state_for_select = params.compaction_state.clone().unwrap_or_default();
-        let tool_names =
-            byop_compaction::message_view::build_tool_name_lookup(all_msgs.iter().copied());
-        let views =
-            byop_compaction::message_view::project(&all_msgs, &state_for_select, &tool_names);
-        let cfg = byop_compaction::CompactionConfig::default();
-        let model_limit = byop_compaction::overflow::ModelLimit::FALLBACK;
-        let result = byop_compaction::algorithm::select(&views, &cfg, model_limit, |slice| {
-            slice
-                .iter()
-                .map(byop_compaction::algorithm::MessageRef::estimate_size)
-                .sum()
-        });
-        // head_end 是 views 里"head 区间"上界,与 all_msgs 同序
-        Some(result.head_end)
+        Some(summarization_head_end(params, &all_msgs))
     } else {
         None
     };
@@ -1746,9 +1847,20 @@ fn build_chat_request(
     // 而 warp 的 `AIAgentInput::ResumeConversation`(handoff/auto-resume after error 等)
     // 不附加新 user 消息,会让序列末尾停在历史 assistant 上。
     // 这里统一兜底:末尾若是 assistant,追加一条隐式 user 消息让上游继续。
+    // A summary request offers no tools (the summary is text alone), and providers that refuse
+    // tool calls in a request without tools (Anthropic, Bedrock) would reject the history it
+    // summarizes, so that history carries its tool calls and results as text.
+    if is_summarization_request {
+        messages = tool_parts_as_text(messages);
+    }
+
     ensure_ends_with_user(&mut messages);
 
-    let mut tools_array = build_tools_array(params);
+    let mut tools_array = if is_summarization_request {
+        Vec::new()
+    } else {
+        build_tools_array(params)
+    };
 
     // Anthropic 路径:给 tools 数组**最后一个 tool**打 1h cache_control breakpoint,
     // 使整个 tools 段成为长 TTL 的静态前缀(对齐 Zed
@@ -1807,6 +1919,55 @@ fn build_chat_request(
         req = req.with_tools(tools_array);
     }
     Ok(req)
+}
+
+/// `messages` with every tool call and tool result turned into text: a call into a line naming
+/// the tool and its arguments, a result into a user message holding its output.
+fn tool_parts_as_text(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .map(|msg| {
+            let has_tool_parts = msg.content.parts().iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolCall(_) | ContentPart::ToolResponse(_)
+                )
+            });
+            if !has_tool_parts {
+                return msg;
+            }
+            let ChatMessage {
+                role,
+                content,
+                options,
+            } = msg;
+            let parts: Vec<ContentPart> = content
+                .into_parts()
+                .into_iter()
+                .map(|part| match part {
+                    ContentPart::ToolCall(call) => ContentPart::Text(format!(
+                        "[Called the tool {} (call {}) with: {}]",
+                        call.fn_name, call.call_id, call.fn_arguments
+                    )),
+                    ContentPart::ToolResponse(response) => ContentPart::Text(format!(
+                        "[Result of tool call {}]\n{}",
+                        response.call_id, response.content
+                    )),
+                    other => other,
+                })
+                .collect();
+            let role = if matches!(role, ChatRole::Tool) {
+                ChatRole::User
+            } else {
+                role
+            };
+            ChatMessage {
+                role,
+                content: MessageContent::from_parts(parts),
+                options,
+            }
+        })
+        .collect()
 }
 
 const BYOP_DIAG_SNIPPET_CHARS: usize = 240;
@@ -3464,6 +3625,18 @@ pub async fn generate_byop_output(
             Some(conversation_id.as_str())
         },
     );
+    let is_summarization = params
+        .input
+        .iter()
+        .any(|i| matches!(i, AIAgentInput::SummarizeConversation { .. }));
+    let chat_opts = if is_summarization {
+        let limit = params
+            .compaction_limit
+            .unwrap_or(byop_compaction::overflow::ModelLimit::FALLBACK);
+        chat_opts.with_max_tokens(summary_max_output_tokens(limit))
+    } else {
+        chat_opts
+    };
     let client = build_client(api_type, &base_url, api_key);
     let request_id = Uuid::new_v4().to_string();
     let mcp_context = params.mcp_context.clone();
@@ -3854,6 +4027,7 @@ pub async fn generate_byop_output(
         let mut captured_cache_create_tokens: i32 = 0;
         // Thought signatures of the Responses API: the encrypted reasoning items of this turn.
         let mut captured_reasoning_items: Vec<String> = Vec::new();
+        let mut captured_stop_reason: Option<genai::chat::StopReason> = None;
 
         while let Some(item) = sdk_stream.next().await {
             let event = match item {
@@ -4101,6 +4275,9 @@ pub async fn generate_byop_output(
                 }
                 ChatStreamEvent::End(end) => {
                     end_count += 1;
+                    if end.captured_stop_reason.is_some() {
+                        captured_stop_reason = end.captured_stop_reason.clone();
+                    }
                     if let (Some(call), Some(usage)) =
                         (&inspector_call, end.captured_usage.as_ref())
                     {
@@ -4180,7 +4357,7 @@ pub async fn generate_byop_output(
         // ZapNG:content→tool 提取 fallback 只对 Ollama 生效,与 :1412 的历史过滤对称——
         // 云端 provider(OpenAI/Anthropic/...)的正文如果恰好长得像 tool JSON(比如模型在
         // 讲解一段 JSON 示例),不应该被误当成真实 ToolCall 执行。
-        if tool_bufs.is_empty() && api_type == AgentProviderApiType::Ollama {
+        if tool_bufs.is_empty() && api_type == AgentProviderApiType::Ollama && !is_summarization {
             let extract_sources: [&str; 2] = [
                 streamed_assistant_text.as_str(),
                 captured_assistant_text.as_deref().unwrap_or(""),
@@ -4279,11 +4456,32 @@ pub async fn generate_byop_output(
             );
         }
 
+        // A summary is used only when it came out whole: anything else ends the stream with an
+        // error, so the controller leaves the history as it was.
+        if is_summarization {
+            let summary_text = captured_assistant_text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or(streamed_assistant_text.as_str());
+            if let Some(reason) =
+                summary_problem(summary_text, total_tools, captured_stop_reason.as_ref())
+            {
+                log::warn!(
+                    "[byop-compaction] summary rejected: {reason} (stop_reason={captured_stop_reason:?})"
+                );
+                yield Err(Arc::new(AIApiError::Other(
+                    byop_compaction::commit::IncompleteSummaryError::new(reason).into(),
+                )));
+                return;
+            }
+        }
+
         // Keep the turn's encrypted reasoning items on a reasoning message without text (nothing
         // is shown for it), added after the turn's output and before the tool results below, so
         // that the next request sends them back with this turn.
         if let Some(data) = reasoning_scope
             .as_ref()
+            .filter(|_| !is_summarization)
             .and_then(|scope| responses_reasoning::encode(scope, &captured_reasoning_items))
         {
             let mut carrier = make_reasoning_message(&current_task_id, &request_id, String::new());
@@ -4657,7 +4855,16 @@ pub async fn generate_byop_output(
                 byok_token_usage: std::collections::HashMap::new(),
             })
         });
-        yield Ok(make_finished_done(usage_metadata));
+        yield Ok(make_finished_done(
+            usage_metadata,
+            finished_token_usage(
+                &model_id,
+                captured_prompt_tokens,
+                captured_completion_tokens,
+                captured_cache_read_tokens,
+                captured_cache_create_tokens,
+            ),
+        ));
     };
 
     Ok(Box::pin(stream))
@@ -5438,8 +5645,68 @@ fn create_subtask_event(subtask_id: &str, parent_task_id: &str) -> api::Response
     }
 }
 
+/// The longest summary a summary request asks for: 8 000 tokens, a quarter of the window, and no
+/// more than the model may write.
+fn summary_max_output_tokens(limit: byop_compaction::overflow::ModelLimit) -> u32 {
+    const SUMMARY_MAX_OUTPUT_TOKENS: usize = 8_000;
+    let mut tokens = SUMMARY_MAX_OUTPUT_TOKENS.min(limit.context / 4);
+    if limit.max_output > 0 {
+        tokens = tokens.min(limit.max_output);
+    }
+    tokens.max(1) as u32
+}
+
+/// Why a summary stream's output can't serve as the summary, if it can't: it was cut off or
+/// stopped for another reason than finishing, it called a tool, or it is empty. A provider that
+/// reports no stop reason is taken to have finished.
+fn summary_problem(
+    text: &str,
+    tool_calls: usize,
+    stop_reason: Option<&genai::chat::StopReason>,
+) -> Option<&'static str> {
+    use genai::chat::StopReason;
+    match stop_reason {
+        None | Some(StopReason::Completed(_)) | Some(StopReason::StopSequence(_)) => {}
+        Some(StopReason::MaxTokens(_)) => return Some("it was cut off at the output limit"),
+        Some(StopReason::ToolCall(_)) => return Some("the model called a tool"),
+        Some(StopReason::ContentFilter(_)) => return Some("the provider filtered it"),
+        Some(StopReason::Other(_)) => return Some("the model stopped before finishing"),
+    }
+    if tool_calls > 0 {
+        return Some("the model called a tool");
+    }
+    if text.trim().is_empty() {
+        return Some("it is empty");
+    }
+    None
+}
+
+/// The usage the provider reported for this request, for `StreamFinished.token_usage`. Input
+/// tokens already include the cached ones (genai counts them in, as OpenAI does). Empty when the
+/// provider reported none.
+fn finished_token_usage(
+    model_id: &str,
+    prompt_tokens: i32,
+    completion_tokens: i32,
+    cache_read_tokens: i32,
+    cache_write_tokens: i32,
+) -> Vec<api::response_event::stream_finished::TokenUsage> {
+    if prompt_tokens <= 0 && completion_tokens <= 0 {
+        return Vec::new();
+    }
+    vec![api::response_event::stream_finished::TokenUsage {
+        model_id: model_id.to_owned(),
+        total_input: prompt_tokens.max(0) as u32,
+        output: completion_tokens.max(0) as u32,
+        input_cache_read: cache_read_tokens.max(0) as u32,
+        input_cache_write: cache_write_tokens.max(0) as u32,
+        cost_in_cents: 0.0,
+    }]
+}
+
 fn make_finished_done(
     usage_metadata: Option<api::response_event::stream_finished::ConversationUsageMetadata>,
+    token_usage: Vec<api::response_event::stream_finished::TokenUsage>,
 ) -> api::ResponseEvent {
     api::ResponseEvent {
         r#type: Some(api::response_event::Type::Finished(
@@ -5448,7 +5715,7 @@ fn make_finished_done(
                     api::response_event::stream_finished::Done {},
                 )),
                 conversation_usage_metadata: usage_metadata,
-                token_usage: vec![],
+                token_usage,
                 should_refresh_model_config: false,
                 request_cost: None,
             },
@@ -8186,5 +8453,177 @@ mod responses_reasoning_replay_tests {
         assert!(assistant_signatures(None).is_empty());
         let other_model = ReasoningScope::new("https://api.openai.com/v1/", "gpt-5-mini");
         assert!(assistant_signatures(Some(&other_model)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod byop_compaction_request_tests {
+    use super::*;
+    use genai::chat::StopReason;
+
+    fn shell_tool() -> api::message::tool_call::Tool {
+        use api::message::tool_call::run_shell_command::WaitUntilCompleteValue;
+
+        api::message::tool_call::Tool::RunShellCommand(api::message::tool_call::RunShellCommand {
+            command: "ls".to_owned(),
+            is_read_only: true,
+            uses_pager: false,
+            is_risky: false,
+            citations: vec![],
+            wait_until_complete_value: Some(WaitUntilCompleteValue::WaitUntilComplete(true)),
+            risk_category: 0,
+        })
+    }
+
+    fn summary_params() -> RequestParams {
+        let task = api::Task {
+            id: "task-1".to_owned(),
+            messages: vec![
+                make_user_query_message("task-1", "req-1", "list the files".to_owned(), &[]),
+                make_tool_call_message("task-1", "req-1", "call-1", shell_tool()),
+                make_tool_call_result_message(
+                    "task-1",
+                    "req-1",
+                    "call-1".to_owned(),
+                    r#"{"status":"completed","output":"a.txt"}"#.to_owned(),
+                ),
+                make_agent_output_message("task-1", "req-1", "There is a.txt.".to_owned()),
+            ],
+            dependencies: None,
+            description: String::new(),
+            summary: String::new(),
+            server_data: String::new(),
+        };
+        let mut params = RequestParams::new_for_test(
+            vec![AIAgentInput::SummarizeConversation {
+                prompt: None,
+                overflow: true,
+            }],
+            vec![task],
+        );
+        params.compaction_config = Some(byop_compaction::CompactionConfig {
+            tail_turns: 0,
+            ..Default::default()
+        });
+        params
+    }
+
+    #[test]
+    fn a_summary_request_offers_no_tools_and_carries_tool_use_as_text() {
+        for api_type in [
+            AgentProviderApiType::OpenAi,
+            AgentProviderApiType::Anthropic,
+        ] {
+            let request = build_chat_request(
+                &summary_params(),
+                false,
+                api_type,
+                attachment_caps::AttachmentCaps::default(),
+                None,
+            )
+            .expect("summary request");
+            assert!(request.tools.is_none(), "{api_type:?}: tools were offered");
+            assert!(
+                request.messages.iter().all(|m| {
+                    m.content.tool_calls().is_empty() && m.content.tool_responses().is_empty()
+                }),
+                "{api_type:?}: a tool part is left"
+            );
+            assert!(request
+                .messages
+                .iter()
+                .all(|m| !matches!(m.role, ChatRole::Tool)));
+            let text: String = request
+                .messages
+                .iter()
+                .flat_map(|m| m.content.texts())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("[Called the tool"), "{text}");
+            assert!(text.contains("a.txt"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_normal_request_still_offers_tools() {
+        let mut params = summary_params();
+        params.input = vec![];
+        let request = build_chat_request(
+            &params,
+            false,
+            AgentProviderApiType::OpenAi,
+            attachment_caps::AttachmentCaps::default(),
+            None,
+        )
+        .expect("request");
+        assert!(request.tools.is_some());
+    }
+
+    #[test]
+    fn the_summary_source_names_what_the_request_summarized() {
+        let params = summary_params();
+        let source = summary_source(&params);
+        let ids: Vec<String> = params.tasks[0]
+            .messages
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(source.head_message_ids, ids);
+        assert_eq!(source.history_message_ids.len(), 4);
+        assert_eq!(source.completed_compactions, 0);
+        assert!(has_summarizable_history(&params));
+    }
+
+    #[test]
+    fn a_summary_is_short_for_a_small_window() {
+        use byop_compaction::overflow::ModelLimit;
+        assert_eq!(summary_max_output_tokens(ModelLimit::FALLBACK), 8_000);
+        let small = ModelLimit::for_model(16_000, 4_096, None).unwrap();
+        assert_eq!(summary_max_output_tokens(small), 4_000);
+        let tight_output = ModelLimit::for_model(200_000, 2_048, None).unwrap();
+        assert_eq!(summary_max_output_tokens(tight_output), 2_048);
+    }
+
+    #[test]
+    fn only_a_finished_text_summary_is_used() {
+        let completed = StopReason::Completed("stop".to_owned());
+        assert_eq!(summary_problem("summary", 0, Some(&completed)), None);
+        assert_eq!(summary_problem("summary", 0, None), None);
+        assert!(
+            summary_problem("summ", 0, Some(&StopReason::MaxTokens("length".to_owned()))).is_some()
+        );
+        assert!(summary_problem("summary", 1, Some(&completed)).is_some());
+        assert!(
+            summary_problem("", 0, Some(&StopReason::ToolCall("tool_use".to_owned()))).is_some()
+        );
+        assert!(summary_problem(" \n", 0, Some(&completed)).is_some());
+    }
+
+    #[test]
+    fn the_finished_event_reports_the_usage() {
+        let usage = finished_token_usage("model-a", 1_200, 300, 1_000, 50);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].model_id, "model-a");
+        assert_eq!(usage[0].total_input, 1_200);
+        assert_eq!(usage[0].output, 300);
+        assert_eq!(usage[0].input_cache_read, 1_000);
+        assert_eq!(usage[0].input_cache_write, 50);
+        assert!(finished_token_usage("model-a", 0, 0, 0, 0).is_empty());
+
+        let event = make_finished_done(None, usage);
+        let Some(api::response_event::Type::Finished(finished)) = event.r#type else {
+            panic!("not a finished event");
+        };
+        assert_eq!(finished.token_usage.len(), 1);
+    }
+
+    #[test]
+    fn a_request_is_estimated_at_two_bytes_a_token() {
+        let req = ChatRequest::from_messages(vec![
+            ChatMessage::user("x".repeat(1_000)),
+            ChatMessage::from(ToolResponse::new("call-1".to_owned(), "y".repeat(3_000))),
+        ])
+        .with_system("z".repeat(1_000));
+        assert_eq!(estimate_chat_request_tokens(&req), 2_500);
     }
 }

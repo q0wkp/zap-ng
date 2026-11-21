@@ -1,12 +1,17 @@
+// SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
+// SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
+// SPDX-License-Identifier: AGPL-3.0-only
+// Modified by Tianyu (Sky) Lu in 2026: tested the model-sized limit, the auto-compaction threshold and the checks before a summary is committed.
+
 //! Phase 1 单元测试 — 覆盖纯函数(token / overflow / prompt / config / algorithm)。
 //!
 //! Phase 3 (state + message_view) 落地后再补 e2e 集成测试。
 
 use super::algorithm::{prune_decisions, select, turns, MessageRef, Role, ToolOutputRef};
-use super::commit::commit_summarization;
+use super::commit::{commit_summarization, SummarySource};
 use super::config::CompactionConfig;
 use super::consts::*;
-use super::overflow::{is_overflow, usable, ModelLimit, TokenCounts};
+use super::overflow::{auto_compaction_threshold, needs_auto_compaction, usable, ModelLimit};
 use super::prompt::{build_continue_message, build_prompt, SUMMARY_TEMPLATE};
 use super::token::estimate;
 use crate::ai::agent::conversation::{AIConversation, AIConversationId};
@@ -88,64 +93,53 @@ fn usable_respects_cfg_reserved_override() {
 }
 
 #[test]
-fn is_overflow_auto_off() {
-    let mut cfg = cfg_default();
-    cfg.auto = false;
-    let model = ModelLimit {
-        context: 200_000,
-        input: 180_000,
-        max_output: 8_000,
-    };
-    let tokens = TokenCounts {
-        total: 999_999,
-        ..Default::default()
-    };
-    assert!(!is_overflow(&cfg, tokens, model));
+fn model_limit_takes_the_smaller_of_the_model_window_and_the_profile_limit() {
+    let limit = ModelLimit::for_model(128_000, 16_000, Some(64_000)).unwrap();
+    assert_eq!(limit.context, 64_000);
+    assert_eq!(limit.max_output, 16_000);
+    let limit = ModelLimit::for_model(128_000, 16_000, Some(500_000)).unwrap();
+    assert_eq!(limit.context, 128_000);
+    let limit = ModelLimit::for_model(0, 0, Some(32_000)).unwrap();
+    assert_eq!(limit.context, 32_000);
+    assert!(ModelLimit::for_model(0, 16_000, None).is_none());
+    assert!(ModelLimit::for_model(0, 16_000, Some(0)).is_none());
 }
 
 #[test]
-fn is_overflow_at_threshold() {
+fn model_limit_caps_the_output_it_reserves() {
+    // Unknown output: the fallback's 8 000.
+    assert_eq!(
+        ModelLimit::for_model(128_000, 0, None).unwrap().max_output,
+        8_000
+    );
+    // opencode's cap of 32 000.
+    assert_eq!(
+        ModelLimit::for_model(1_000_000, 128_000, None)
+            .unwrap()
+            .max_output,
+        32_000
+    );
+    // A catalog that lists the whole window as the output limit leaves half for input.
+    let limit = ModelLimit::for_model(32_000, 32_000, None).unwrap();
+    assert_eq!(limit.max_output, 16_000);
+    assert_eq!(usable(&cfg_default(), limit), 16_000);
+}
+
+#[test]
+fn auto_compaction_starts_at_80_percent_of_the_input_budget() {
     let cfg = cfg_default();
-    let model = ModelLimit {
-        context: 200_000,
-        input: 180_000,
-        max_output: 8_000,
-    };
-    let usable_n = usable(&cfg, model);
-    let tokens = TokenCounts {
-        total: usable_n,
+    let model = ModelLimit::for_model(128_000, 8_000, None).unwrap();
+    assert_eq!(usable(&cfg, model), 120_000);
+    assert_eq!(auto_compaction_threshold(&cfg, model), 96_000);
+    assert!(needs_auto_compaction(&cfg, 96_000, model));
+    assert!(!needs_auto_compaction(&cfg, 95_999, model));
+    // No reported usage never triggers it, nor does a disabled setting.
+    assert!(!needs_auto_compaction(&cfg, 0, model));
+    let off = CompactionConfig {
+        auto: false,
         ..Default::default()
     };
-    assert!(is_overflow(&cfg, tokens, model));
-    let tokens_below = TokenCounts {
-        total: usable_n - 1,
-        ..Default::default()
-    };
-    assert!(!is_overflow(&cfg, tokens_below, model));
-}
-
-#[test]
-fn token_counts_count_uses_total_when_present() {
-    let t = TokenCounts {
-        total: 100,
-        input: 50,
-        output: 60,
-        cache_read: 10,
-        cache_write: 5,
-    };
-    assert_eq!(t.count(), 100); // total 优先
-}
-
-#[test]
-fn token_counts_count_sums_when_total_zero() {
-    let t = TokenCounts {
-        total: 0,
-        input: 50,
-        output: 60,
-        cache_read: 10,
-        cache_write: 5,
-    };
-    assert_eq!(t.count(), 125);
+    assert!(!needs_auto_compaction(&off, 1_000_000, model));
 }
 
 // -- preserve_recent_budget ----------------------------------------------
@@ -606,26 +600,115 @@ fn conversation_with_messages(messages: Vec<api::Message>) -> AIConversation {
     AIConversation::new_restored(AIConversationId::new(), vec![task], None).unwrap()
 }
 
+fn source(head: &[&str], history: &[&str]) -> SummarySource {
+    SummarySource {
+        head_message_ids: head.iter().map(|id| id.to_string()).collect(),
+        history_message_ids: history.iter().map(|id| id.to_string()).collect(),
+        completed_compactions: 0,
+    }
+}
+
+const HISTORY: [&str; 4] = ["u1", "a1", "u2", "a2"];
+
+fn conversation_with_summary(summary_text: &str) -> AIConversation {
+    let mut summary = agent_output("s1", "root", "r3", 5);
+    if let Some(api::message::Message::AgentOutput(a)) = summary.message.as_mut() {
+        a.text = summary_text.to_string();
+    }
+    conversation_with_messages(vec![
+        user_query("u1", "root", "r1", 1),
+        agent_output("a1", "root", "r1", 2),
+        user_query("u2", "root", "r2", 3),
+        agent_output("a2", "root", "r2", 4),
+        summary,
+    ])
+}
+
 #[test]
-fn commit_summarization_records_head_message_ids() {
+fn commit_summarization_hides_what_the_request_summarized() {
+    let mut conversation = conversation_with_summary("the summary");
+
+    assert!(commit_summarization(
+        &mut conversation,
+        true,
+        &source(&["u1", "a1"], &HISTORY)
+    ));
+    let completed = conversation.compaction_state.completed().last().unwrap();
+    // The summary takes the place of the first summarized message, and the latest user query
+    // stays visible.
+    assert_eq!(completed.user_msg_id, "u1");
+    assert_eq!(completed.assistant_msg_id, "s1");
+    assert_eq!(completed.head_message_ids, ["u1", "a1"]);
+    assert_eq!(completed.tail_start_id.as_deref(), Some("u2"));
+    assert_eq!(completed.summary_text.as_deref(), Some("the summary"));
+    assert!(completed.auto);
+    let hidden = conversation.compaction_state.hidden_message_ids();
+    assert!(!hidden.contains("u2"));
+    assert!(!hidden.contains("a2"));
+}
+
+#[test]
+fn commit_summarization_ignores_an_output_that_was_already_in_the_history() {
     let mut conversation = conversation_with_messages(vec![
         user_query("u1", "root", "r1", 1),
         agent_output("a1", "root", "r1", 2),
         user_query("u2", "root", "r2", 3),
         agent_output("a2", "root", "r2", 4),
-        user_query("u3", "root", "r3", 5),
-        agent_output("a3", "root", "r3", 6),
     ]);
-    let cfg = CompactionConfig {
-        tail_turns: 1,
-        preserve_recent_tokens: Some(1_000),
-        ..Default::default()
-    };
 
-    assert!(commit_summarization(&mut conversation, false, &cfg));
-    let completed = conversation.compaction_state.completed().last().unwrap();
-    assert_eq!(completed.user_msg_id, "u3");
-    assert_eq!(completed.assistant_msg_id, "a3");
-    assert_eq!(completed.tail_start_id.as_deref(), Some("u3"));
-    assert_eq!(completed.head_message_ids, ["u1", "a1", "u2", "a2"]);
+    assert!(!commit_summarization(
+        &mut conversation,
+        true,
+        &source(&["u1", "a1"], &HISTORY)
+    ));
+    assert!(conversation.compaction_state.completed().is_empty());
+}
+
+#[test]
+fn commit_summarization_refuses_an_empty_summary() {
+    let mut conversation = conversation_with_summary("  \n");
+
+    assert!(!commit_summarization(
+        &mut conversation,
+        true,
+        &source(&["u1", "a1"], &HISTORY)
+    ));
+    assert!(conversation.compaction_state.completed().is_empty());
+}
+
+#[test]
+fn commit_summarization_refuses_when_nothing_was_summarized() {
+    let mut conversation = conversation_with_summary("the summary");
+
+    assert!(!commit_summarization(
+        &mut conversation,
+        true,
+        &source(&[], &HISTORY)
+    ));
+}
+
+#[test]
+fn commit_summarization_refuses_a_history_that_changed_meanwhile() {
+    // A summarized message is gone.
+    let mut conversation = conversation_with_summary("the summary");
+    assert!(!commit_summarization(
+        &mut conversation,
+        true,
+        &source(&["u0", "u1"], &["u0", "u1", "a1", "u2", "a2"])
+    ));
+    assert!(conversation.compaction_state.completed().is_empty());
+
+    // Another compaction was committed after the request was built.
+    let mut conversation = conversation_with_summary("the summary");
+    assert!(commit_summarization(
+        &mut conversation,
+        true,
+        &source(&["u1"], &HISTORY)
+    ));
+    assert!(!commit_summarization(
+        &mut conversation,
+        true,
+        &source(&["u1", "a1"], &HISTORY)
+    ));
+    assert_eq!(conversation.compaction_state.completed().len(), 1);
 }

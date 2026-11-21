@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: passed no model limit for compaction from a shared session's stream; renamed the Warp and Zap names to ZapNG.
 
 // BlocklistAIController 的共享会话本地展示逻辑。
 use itertools::Itertools;
@@ -334,6 +334,7 @@ impl BlocklistAIController {
             conversation_id,
             did_exchange_contain_user_query,
             // shared session 路径不会触发本地压缩(来自远端 viewer 同步流),始终 None
+            None,
             None,
             ctx,
         );

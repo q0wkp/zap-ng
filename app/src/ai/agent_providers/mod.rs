@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: declared the new explain-command, Ollama, custom-prompt, request-inspector and secret-redaction modules, and made disabled providers and models offer nothing; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: declared the new explain-command, Ollama, custom-prompt, request-inspector and secret-redaction modules, made disabled providers and models offer nothing, and looked up a model's token limit for compaction; renamed the Warp and Zap names to ZapNG.
 
 //! 自定义 Agent 提供商支持。
 //!
@@ -180,6 +180,67 @@ pub fn build_byop_models_by_feature(app: &AppContext) -> ModelsByFeature {
         cli_agent: Some(make()),
         computer_use: Some(make()),
     }
+}
+
+/// The token limit BYOP compaction sizes a conversation of the model `id` against: the window and
+/// output limit set for the model in its provider (filled from models.dev or Ollama when the
+/// model was added), else what the models.dev catalog lists for it, narrowed to the profile's
+/// context-window limit. The fixed fallback only when neither knows the window.
+pub fn byop_model_limit(
+    app: &AppContext,
+    id: &ai::LLMId,
+    profile_limit: Option<u32>,
+) -> Option<crate::ai::byop_compaction::overflow::ModelLimit> {
+    use crate::ai::byop_compaction::overflow::ModelLimit;
+    let (provider, _, model_id) = lookup_byop(app, id)?;
+    let (mut window, mut max_output) = provider
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .map(|m| (m.context_window, m.max_output_tokens))
+        .unwrap_or((0, 0));
+    if window == 0 || max_output == 0 {
+        if let Some((catalog_window, catalog_output)) =
+            models_dev::lookup_limit(&provider.id, &model_id)
+        {
+            if window == 0 {
+                window = catalog_window;
+            }
+            if max_output == 0 {
+                max_output = catalog_output;
+            }
+        }
+    }
+    Some(
+        ModelLimit::for_model(
+            window as usize,
+            max_output as usize,
+            profile_limit.map(|limit| limit as usize),
+        )
+        .unwrap_or(ModelLimit::FALLBACK),
+    )
+}
+
+/// A rough token count of the BYOP request `params` would send, or `None` when its model is not
+/// a BYOP model or the request can't be built.
+pub fn estimate_byop_request_tokens(
+    app: &AppContext,
+    params: &crate::ai::agent::api::RequestParams,
+) -> Option<usize> {
+    let (provider, _, model_id) = lookup_byop(app, &params.model)?;
+    let caps = provider
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .map(|m| attachment_caps::resolve_for_model(&provider.id, provider.api_type, m))
+        .unwrap_or_else(|| attachment_caps::caps_for(provider.api_type, &model_id));
+    chat_stream::estimate_request_tokens(
+        params,
+        provider.api_type,
+        &model_id,
+        &provider.base_url,
+        caps,
+    )
 }
 
 /// 给定一个 BYOP `LLMId`,从 `AISettings` 与 secrets 里查出 `(provider, api_key, model_id)`。

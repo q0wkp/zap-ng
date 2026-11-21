@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
+// SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
+// SPDX-License-Identifier: AGPL-3.0-only
+// Modified by Tianyu (Sky) Lu in 2026: sized the limit from the model's own window and output limit, and started auto-compaction at 80% of the input budget, counting the reported input and output once instead of adding the cached tokens again.
+
 //! Overflow 判断 — 1:1 移植 opencode `packages/opencode/src/session/overflow.ts`。
 //!
 //! ```ts
@@ -42,29 +47,43 @@ impl ModelLimit {
         input: 180_000,
         max_output: 8_000,
     };
-}
 
-/// 当前对话累计 token 用量 — 字段对齐 opencode `MessageV2.Assistant.tokens`。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TokenCounts {
-    /// LLM 直接给的总数(优先用)
-    pub total: usize,
-    pub input: usize,
-    pub output: usize,
-    pub cache_read: usize,
-    pub cache_write: usize,
-}
-
-impl TokenCounts {
-    /// 对齐 opencode:`tokens.total || input+output+cache.read+cache.write`
-    pub fn count(&self) -> usize {
-        if self.total > 0 {
-            self.total
+    /// The limit of a model whose context window and output limit are known (0 for unknown),
+    /// narrowed to the profile's context-window limit when that is smaller. `None` when no
+    /// window is known at all.
+    ///
+    /// The output reserved for a reply is capped as opencode's `maxOutputTokens` caps it, and
+    /// at half the window, since some catalogs list a model's output limit as its whole window.
+    pub fn for_model(
+        context_window: usize,
+        max_output: usize,
+        profile_limit: Option<usize>,
+    ) -> Option<ModelLimit> {
+        let context = match (context_window, profile_limit.filter(|limit| *limit > 0)) {
+            (0, None) => return None,
+            (0, Some(limit)) => limit,
+            (window, None) => window,
+            (window, Some(limit)) => window.min(limit),
+        };
+        let max_output = if max_output == 0 {
+            Self::FALLBACK.max_output
         } else {
-            self.input + self.output + self.cache_read + self.cache_write
-        }
+            max_output
+        };
+        Some(ModelLimit {
+            context,
+            input: 0,
+            max_output: max_output.min(OUTPUT_TOKEN_MAX).min(context / 2),
+        })
     }
 }
+
+/// The most output tokens reserved for a reply when sizing the input budget (opencode's
+/// `OUTPUT_TOKEN_MAX`).
+pub const OUTPUT_TOKEN_MAX: usize = 32_000;
+
+/// The share of the input budget, in percent, at which BYOP auto-compaction starts.
+pub const AUTO_COMPACTION_PERCENT: usize = 80;
 
 /// 可用 token 数 — `cfg.reserved ?? min(COMPACTION_BUFFER, max_output)` 作为缓冲。
 pub fn usable(cfg: &CompactionConfig, model: ModelLimit) -> usize {
@@ -81,13 +100,14 @@ pub fn usable(cfg: &CompactionConfig, model: ModelLimit) -> usize {
     }
 }
 
-/// `count >= usable(...)` 即 overflow。`cfg.auto == false` 时永远 false。
-pub fn is_overflow(cfg: &CompactionConfig, tokens: TokenCounts, model: ModelLimit) -> bool {
-    if !cfg.auto {
-        return false;
-    }
-    if model.context == 0 {
-        return false;
-    }
-    tokens.count() >= usable(cfg, model)
+/// The token count at which auto-compaction starts: [`AUTO_COMPACTION_PERCENT`] of
+/// [`usable`].
+pub fn auto_compaction_threshold(cfg: &CompactionConfig, model: ModelLimit) -> usize {
+    usable(cfg, model) * AUTO_COMPACTION_PERCENT / 100
+}
+
+/// Whether a conversation of `tokens` tokens is to be compacted before it goes on. A count of 0
+/// (a provider that reported no usage) never is.
+pub fn needs_auto_compaction(cfg: &CompactionConfig, tokens: usize, model: ModelLimit) -> bool {
+    cfg.auto && model.context > 0 && tokens > 0 && tokens >= auto_compaction_threshold(cfg, model)
 }

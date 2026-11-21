@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: added the active profile's prompt overrides to the request params and made the secret-redaction flag crate-visible; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: added the active profile's prompt overrides to the request params made the secret-redaction flag crate-visible, and carried the compaction settings and model limit a BYOP request is sized against; renamed the Warp and Zap names to ZapNG.
 
 pub(crate) mod convert_conversation;
 mod convert_from;
@@ -146,6 +146,11 @@ pub struct RequestParams {
     ///
     /// 默认 `None` = 兼容路径(无压缩)。
     pub compaction_state: Option<crate::ai::byop_compaction::state::CompactionState>,
+    /// ZapNG BYOP: the compaction settings and the model's token limit this request is sized
+    /// against, filled in by the controller next to `compaction_state`, so that a summary
+    /// request and the commit of its summary cut the history at the same place.
+    pub compaction_config: Option<crate::ai::byop_compaction::CompactionConfig>,
+    pub compaction_limit: Option<crate::ai::byop_compaction::overflow::ModelLimit>,
     /// ZapNG BYOP repair sidecar 快照。serializer 只读使用,不在请求构造中反序列化持久化 JSON。
     pub byop_repair_state: crate::ai::byop_readiness::RepairStateStatus,
     /// ZapNG BYOP 专用:本轮是否需要模拟上游 CreateTask 流程来升级 optimistic CLI subtask。
@@ -244,6 +249,8 @@ impl RequestParams {
             lrc_command_id: None,
             lrc_running_command: None,
             compaction_state: None,
+            compaction_config: None,
+            compaction_limit: None,
             byop_repair_state: Default::default(),
             lrc_should_spawn_subagent: false,
         }
@@ -454,6 +461,8 @@ impl RequestParams {
             // BYOP-only:由 controller 在 dispatch 到 BYOP exec 前回填(setter 风格,
             // 避免穿过 ConversationRequestData / 非 BYOP 路径)。
             compaction_state: None,
+            compaction_config: None,
+            compaction_limit: None,
             byop_repair_state: Default::default(),
         }
     }

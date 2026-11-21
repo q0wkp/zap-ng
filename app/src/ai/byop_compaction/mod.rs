@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: declared the module that shows a compaction summary as a collapsed marker.
+// Modified by Tianyu (Sky) Lu in 2026: declared the module that shows a compaction summary as a collapsed marker, and pointed to the auto-compaction check that is used.
 
 //! BYOP 本地会话压缩 — 1:1 复刻 opencode `packages/opencode/src/session/{compaction,overflow,summary}.ts`。
 //!
 //! 入口 API:
-//! - [`overflow::is_overflow`] — 自动触发判断(基于 LLM response usage)
+//! - [`overflow::needs_auto_compaction`] — 自动触发判断(基于 LLM response usage 或待发请求的估算大小)
 //! - [`algorithm::select`] — 切分 head(送摘要 LLM) + tail(原样保留)
 //! - [`algorithm::prune`] — 只清旧 tool output(不删消息)
 //! - [`prompt::build_prompt`] — 拼摘要请求文本
@@ -23,7 +23,6 @@ pub mod summary_marker;
 pub mod token;
 
 pub use config::CompactionConfig;
-pub use overflow::{is_overflow, usable};
 
 /// 字节级对齐 opencode `compaction.ts` 顶部常数(行 33-39, overflow.ts:6, util/token.ts:1)。
 pub mod consts {
