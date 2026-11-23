@@ -24,6 +24,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::time::Duration;
     use virtual_fs::{Stub, VirtualFS};
     use zap_ng_util::standardized_path::StandardizedPath;
@@ -1339,6 +1340,87 @@ Thumbs.db
                     "home dir entry must be present in the repository map"
                 );
             });
+        });
+    }
+
+    /// A watcher that follows symlinks names a change inside a linked directory by the link's path.
+    /// The tree holds the directory under its target, so the change belongs there.
+    #[test]
+    fn changes_named_through_a_symlinked_directory_land_under_its_target() {
+        VirtualFS::test("symlinked_event_paths", |dirs, mut fs| {
+            fs.mkdir("venv/lib/pkg/sub").with_files(vec![
+                Stub::FileWithContent("venv/lib/pkg/mod.py", ""),
+                Stub::FileWithContent("venv/lib/pkg/sub/deep.py", ""),
+                Stub::FileWithContent("venv/lib/top.py", ""),
+            ]);
+            let repo_path = dunce::canonicalize(dirs.tests()).unwrap();
+            std::os::unix::fs::symlink("lib", repo_path.join("venv/lib64")).unwrap();
+
+            let root = Arc::new(StandardizedPath::try_from_local(&repo_path).unwrap());
+            let mut server_tree = FileTreeEntry::new_for_directory(root.clone());
+            let mut client_tree = FileTreeEntry::new_for_directory(root);
+            let std_path = |relative: &str| {
+                StandardizedPath::try_from_local(&repo_path.join(relative)).unwrap()
+            };
+
+            let sync = |server_tree: &mut FileTreeEntry,
+                        client_tree: &mut FileTreeEntry,
+                        update: RepoUpdate| {
+                let mutations = block_on(LocalRepoMetadataModel::compute_file_tree_mutations(
+                    &update,
+                    &[],
+                ));
+                let update = LocalRepoMetadataModel::apply_file_tree_mutations(
+                    server_tree,
+                    mutations,
+                    false,
+                    true,
+                )
+                .expect("update should be produced");
+                client_tree.apply_repo_metadata_update(&update);
+            };
+
+            sync(
+                &mut server_tree,
+                &mut client_tree,
+                RepoUpdate {
+                    added: vec![
+                        repo_path.join("venv/lib64/pkg"),
+                        repo_path.join("venv/lib64/top.py"),
+                    ],
+                    deleted: vec![],
+                    moved: HashMap::new(),
+                },
+            );
+
+            for tree in [&server_tree, &client_tree] {
+                for path in [
+                    "venv/lib/pkg",
+                    "venv/lib/pkg/mod.py",
+                    "venv/lib/pkg/sub",
+                    "venv/lib/pkg/sub/deep.py",
+                    "venv/lib/top.py",
+                ] {
+                    assert!(tree.get(&std_path(path)).is_some(), "{path} should exist");
+                }
+                assert!(tree.get(&std_path("venv/lib64")).is_none());
+                assert!(tree.get(&std_path("venv/lib64/pkg")).is_none());
+                assert!(tree.get(&std_path("venv/lib64/top.py")).is_none());
+            }
+
+            std::fs::remove_file(repo_path.join("venv/lib/top.py")).unwrap();
+            sync(
+                &mut server_tree,
+                &mut client_tree,
+                RepoUpdate {
+                    added: vec![],
+                    deleted: vec![repo_path.join("venv/lib64/top.py")],
+                    moved: HashMap::new(),
+                },
+            );
+
+            assert!(server_tree.get(&std_path("venv/lib/top.py")).is_none());
+            assert!(client_tree.get(&std_path("venv/lib/top.py")).is_none());
         });
     }
 }
