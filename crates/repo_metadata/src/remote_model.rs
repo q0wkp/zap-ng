@@ -194,8 +194,12 @@ impl RemoteRepoMetadataModel {
             .cloned();
 
         let Some(id) = matching_id else {
-            log::warn!(
-                "No remote repository found for incremental update: {}",
+            // The server sends an update to every connection, also to one that was never sent
+            // this repository's snapshot (it connected later, or dropped the host's
+            // repositories when its last session there ended). Nothing is wrong, and nothing is
+            // lost: the repository is sent whole once a session navigates into it.
+            log::debug!(
+                "Ignoring an incremental update for a repository not held here: {}",
                 update.repo_path
             );
             return;
