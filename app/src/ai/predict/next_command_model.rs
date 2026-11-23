@@ -20,7 +20,7 @@ use futures::stream::AbortHandle;
 use itertools::Itertools;
 #[cfg_attr(not(feature = "local_fs"), allow(unused_imports))]
 use parking_lot::{FairMutex, Mutex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(feature = "local_fs")]
 use std::time::Duration;
@@ -49,7 +49,9 @@ cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
         use diesel::SqliteConnection;
         use std::path::PathBuf;
+        use zap_ng_completer::completer::PathCompletionContext;
         use zap_ng_completer::parsers::hir::ArgType;
+        use zap_ng_util::path::expand_session_home;
     }
 }
 
@@ -116,6 +118,11 @@ const NUM_ADDITIONAL_PREV_COMMAND_CONTEXT_LLM: usize = 2;
 
 #[cfg(feature = "local_fs")]
 const ARG_GENERATOR_VALIDATION_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// The most distinct history commands validated for one autosuggestion. Validating a command can
+/// take a round trip to the session's host, and they are validated one after another while the
+/// user waits for the suggestion.
+const MAX_HISTORY_AUTOSUGGESTION_CANDIDATES: usize = 20;
 
 pub fn is_next_command_enabled(app: &zap_ng_ui::AppContext) -> bool {
     AISettings::as_ref(app).is_intelligent_autosuggestions_enabled(app)
@@ -201,6 +208,9 @@ pub struct NextCommandModel {
     cached_zerostate_next_command_context: Option<NextCommandContext>,
     zerostate_suggestion_info: Option<ZeroStateSuggestionInfo>,
     next_command_abort_handle: Option<AbortHandle>,
+    /// The completion context of a remote session, kept while the user types at one prompt so that
+    /// its directory listings are fetched once rather than for every keystroke.
+    remote_completion_context: Option<SessionContext>,
 }
 
 impl Entity for NextCommandModel {
@@ -230,6 +240,7 @@ impl NextCommandModel {
             cached_zerostate_next_command_context: None,
             zerostate_suggestion_info: None,
             next_command_abort_handle: None,
+            remote_completion_context: None,
         }
     }
 
@@ -300,7 +311,37 @@ impl NextCommandModel {
         self.next_command_state = NextCommandSuggestionState::None;
         self.cached_zerostate_next_command_context = None;
         self.zerostate_suggestion_info = None;
+        self.remote_completion_context = None;
         self.abort_inflight_request();
+    }
+
+    /// Returns the completion context to validate suggestions with.
+    ///
+    /// Every directory listing in a remote session is a round trip to its host, and the context
+    /// holds the cache of those listings. While the user types at one prompt of a remote session,
+    /// the context of the previous keystroke is reused, so that a directory is listed once. A
+    /// block that completes may have changed the directories, so the zero-state request made then
+    /// starts with a new context. Local sessions always get the new context.
+    fn completion_context_for_validation(
+        &mut self,
+        new_context: SessionContext,
+        is_typing: bool,
+    ) -> SessionContext {
+        if new_context.session.is_local() {
+            self.remote_completion_context = None;
+            return new_context;
+        }
+        if is_typing {
+            if let Some(kept) = &self.remote_completion_context {
+                if Arc::ptr_eq(&kept.session, &new_context.session)
+                    && kept.current_working_directory == new_context.current_working_directory
+                {
+                    return kept.clone();
+                }
+            }
+        }
+        self.remote_completion_context = Some(new_context.clone());
+        new_context
     }
 
     pub fn abort_inflight_request(&mut self) {
@@ -412,7 +453,9 @@ impl NextCommandModel {
             Vec::new()
         };
 
-        let completion_context = completer_data.completion_session_context(ctx);
+        let completion_context = completer_data
+            .completion_session_context(ctx)
+            .map(|context| self.completion_context_for_validation(context, prefix.is_some()));
         // This is only needed if we have a prefix.
         let reverse_chronological_potential_autosuggestions = if let Some(prefix) = &prefix {
             Self::get_reverse_chronological_potential_autosuggestions(prefix, &completer_data, ctx)
@@ -655,6 +698,10 @@ impl NextCommandModel {
         ) = result;
         let end_ts_ms = Utc::now().timestamp_millis();
         let request_duration_ms = end_ts_ms - start_ts_ms;
+        log::debug!(
+            "Next command suggestion took {request_duration_ms} ms (with prefix: {}, from AI: {is_from_ai})",
+            request.prefix.is_some()
+        );
         if request.prefix.is_none() {
             self.cached_zerostate_next_command_context = Some(next_command_context);
         }
@@ -726,8 +773,16 @@ async fn is_arg_valid(
             // If the argument has one or more generators, validate these last because they're more expensive
             // and we can check all generators together using completions suggestions.
             let mut has_generator_arg_type = false;
+            // The paths of a remote session are on its host, not on this machine's disk.
+            let is_local_session = ctx.session.is_local();
             for arg_type in arg_types_to_validate {
                 match arg_type {
+                    ArgType::File | ArgType::Folder if !is_local_session => {
+                        let wants_directory = matches!(arg_type, ArgType::Folder);
+                        if session_path_exists(arg.value().as_str(), wants_directory, ctx).await {
+                            return true;
+                        }
+                    }
                     ArgType::File => {
                         let mut path_arg = PathBuf::from(arg.value().as_str());
                         if path_arg.is_relative() {
@@ -805,6 +860,36 @@ async fn is_arg_valid(
     }
 }
 
+/// Whether `path` names a file, or with `wants_directory` a directory, on the session's host,
+/// judged from the session's listing of the directory that holds it.
+/// If the listing takes too long, the path is assumed to exist, as for generators.
+#[cfg(feature = "local_fs")]
+async fn session_path_exists(path: &str, wants_directory: bool, ctx: &SessionContext) -> bool {
+    let path = expand_session_home(path, ctx.home_directory(), ctx.path_separators().all);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        ctx.current_working_directory.join(path)
+    }
+    .normalize();
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        // The root directory has no parent to find it in.
+        return wants_directory;
+    };
+    let file_name = String::from_utf8_lossy(file_name);
+    let Ok(entries) = ctx
+        .list_directory_entries(parent.to_path_buf())
+        .with_timeout(ARG_GENERATOR_VALIDATION_TIMEOUT)
+        .await
+    else {
+        log::debug!("Listing the directory of `{path:?}` timed out - assuming the path exists");
+        return true;
+    };
+    entries
+        .iter()
+        .any(|entry| entry.file_name() == file_name && entry.is_dir() == wants_directory)
+}
+
 /// Validates the command is valid.
 /// Currently uses completions specs to check if parsing is successful, and validates
 /// that any filepaths args actually exist on disk.
@@ -868,7 +953,9 @@ pub async fn is_command_valid(
 /// Scans the given history entries in reverse order for commands that start
 /// with the buffer text to return as a potential autosuggestion. Prioritizes commands
 /// in history that were executed in the user's current working directory,
-/// with any command executed in other directories at the end.
+/// with any command executed in other directories at the end. A command that was run more than
+/// once is returned once, at its first place in that order, and at most
+/// `MAX_HISTORY_AUTOSUGGESTION_CANDIDATES` commands are returned.
 fn find_potential_autosuggestions_from_history<'a>(
     history_entries: impl DoubleEndedIterator<Item = &'a HistoryEntry>,
     buffer_text: &str,
@@ -892,8 +979,13 @@ fn find_potential_autosuggestions_from_history<'a>(
             commands_in_other_dirs.push(entry.clone());
         }
     }
-    commands_in_same_dir.extend(commands_in_other_dirs);
+    let mut seen_commands = HashSet::new();
     commands_in_same_dir
+        .into_iter()
+        .chain(commands_in_other_dirs)
+        .filter(|entry| seen_commands.insert(entry.command.clone()))
+        .take(MAX_HISTORY_AUTOSUGGESTION_CANDIDATES)
+        .collect()
 }
 
 #[cfg(test)]

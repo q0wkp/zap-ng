@@ -932,7 +932,11 @@ impl Session {
 
     pub fn home_dir(&self) -> Option<&str> {
         if cfg!(test) {
-            return zap_ng_util::path::TEST_SESSION_HOME_DIR.as_deref();
+            return self
+                .info
+                .home_dir
+                .as_deref()
+                .or(zap_ng_util::path::TEST_SESSION_HOME_DIR.as_deref());
         }
 
         self.info.home_dir.as_deref()
