@@ -31,6 +31,9 @@ wasm-bindgen.workspace = true
 web-sys.workspace = true
 zap_ng_web_event_bus.workspace = true
 
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+tempfile.workspace = true
+
 [features]
 crash_reporting = ["zap_ng_core/crash_reporting"]
 agent_mode_evals = []

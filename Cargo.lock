@@ -17377,6 +17377,7 @@ dependencies = [
  "js-sys",
  "log",
  "log-panics",
+ "tempfile",
  "wasm-bindgen",
  "web-sys",
  "zap_ng_core",

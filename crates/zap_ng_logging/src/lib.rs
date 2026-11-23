@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: renamed the Warp and Zap names to ZapNG; added the limit on the
+// total size of the log files.
 
 /// Destination for log output.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -14,18 +15,39 @@ pub enum LogDestination {
 }
 
 /// Configuration for initializing the logger.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct LogConfig {
     /// Whether the caller is the CLI. When true, logs are written to a separate subdirectory
     /// with a higher rotation limit so that CLI invocations don't evict GUI application logs.
     pub is_cli: bool,
     /// The destination for log output. If `None`, the destination is inferred from the environment.
     pub log_destination: Option<LogDestination>,
+    /// Optional in-session size threshold for `zap-ng.log`. When `Some(n)` and the active
+    /// file accumulates more than `n` bytes during a single execution, it is rotated to
+    /// `zap-ng.log.in_session.0` and a fresh active file is opened. Older `.in_session.N`
+    /// files shift up and the oldest is discarded, matching the per-startup
+    /// `rotate_log_files` behavior. `None` preserves the existing unbounded-within-session
+    /// growth (Warp issue 10879).
+    pub max_file_size_bytes: Option<u64>,
+    /// Optional limit on the disk space the log files take together: the active file, the
+    /// files rotated out of it while running and the files of earlier executions. After each
+    /// rotation the oldest files are deleted until the rest, with a full active file, fits.
+    /// `None` leaves only the number of files limited.
+    pub max_total_size_bytes: Option<u64>,
 }
+
+/// The size a log file is rotated at where nothing else is configured.
+pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// The disk space the log files may take together where nothing else is configured.
+pub const DEFAULT_MAX_TOTAL_SIZE_BYTES: u64 = 500 * 1024 * 1024;
 
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 #[cfg_attr(target_family = "wasm", path = "wasm.rs")]
 mod imp;
+
+#[cfg(not(target_family = "wasm"))]
+mod rotation;
 
 pub use imp::init;
 #[cfg(not(target_family = "wasm"))]

@@ -48,6 +48,7 @@ fn main() -> Result<()> {
     zap_ng_logging::init(zap_ng_logging::LogConfig {
         is_cli: false,
         log_destination: None,
+        ..Default::default()
     })?;
 
     let app_builder =

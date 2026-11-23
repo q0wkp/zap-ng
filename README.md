@@ -19,6 +19,7 @@ ZapNG is a local-first agentic terminal for Linux and macOS, forked from [Warp](
 - [Features](#features)
 - [Configuration](#configuration)
 - [Plugins](#plugins)
+- [Logs](#logs)
 - [Importing from Zap](#importing-from-zap)
 - [Compatibility](#compatibility)
 - [Changes from the Original Zap](#changes-from-the-original-zap)
@@ -52,7 +53,7 @@ ZapNG keeps its settings in two files in the same directory, `~/.config/zap-ng` 
 | File | Holds |
 |------|-------|
 | `settings.toml` | The settings Warp has, under the paths Warp gives them, so that the file stays interchangeable with Warp's |
-| `zap-ng.toml` | The settings only ZapNG has (model providers, BYOP, CLI agents, the interface language and fonts, the proxy, the SSH manager, sync, updates), and what concerns plugins |
+| `zap-ng.toml` | The settings only ZapNG has (model providers, BYOP, CLI agents, the interface language and fonts, the proxy, the SSH manager, sync, updates), and what concerns plugins and the log files' size |
 
 Both files are watched: a change takes effect without a restart.
 
@@ -84,6 +85,16 @@ enabled = false
 ```
 
 The plugins in [`plugins/`](plugins) are built with `script/build_plugins <DEST>`, which needs the Rust target `wasm32-wasip2`.
+
+## Logs
+
+The log file is rotated once it reaches 50 MB, also while ZapNG keeps running, and the oldest log files are deleted so that all of them together take at most 500 MB. `zap-ng.toml` changes both limits, in megabytes; a change takes effect at the next start, and `0` turns a limit off:
+
+```toml
+[logging]
+max_file_size_mb = 50
+max_total_size_mb = 500
+```
 
 ## Importing from Zap
 
