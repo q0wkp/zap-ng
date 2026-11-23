@@ -2068,6 +2068,10 @@ fn should_replace_tool_response(existing: &ToolResponse, candidate: &ToolRespons
         || !is_placeholder_tool_response_content(&candidate.content)
 }
 
+/// How much of a tool call's arguments is logged when they can't be parsed: enough to see their
+/// shape, without writing a whole file edit to the log.
+const FAILED_ARGS_LOG_CHARS: usize = 500;
+
 fn snippet_for_log(s: &str, max_chars: usize) -> String {
     use std::fmt::Write as _;
 
@@ -3765,7 +3769,8 @@ pub async fn generate_byop_output(
     }))
     .unwrap_or_default();
     log::info!("[byop] diag_body_approx_len={}", diag_body_json.len());
-    log::info!("[byop-diag] full_request_json={diag_body_json}");
+    // The whole request (prompts, file contents, tool results) is logged only at debug level.
+    log::debug!("[byop-diag] full_request_json={diag_body_json}");
 
     // 主动扫描原始文本里的"可疑反斜杠序列":serde_json 把源字符串里的字面
     // `\` 序列化为 `\\`,所以 wire body 里出现"两个连续反斜杠 + u/x" 才意味着
@@ -4107,7 +4112,7 @@ pub async fn generate_byop_output(
                     if let Some(call) = inspector_call.take() {
                         call.fail(&err_text);
                     }
-                    log::error!("[byop-diag] full_request_json_on_error={diag_body_json}");
+                    log::debug!("[byop-diag] full_request_json_on_error={diag_body_json}");
                     // 从错误消息里 parse "column N",dump diag_body_json 该位置 ±200 char 上下文 + 字节 hex。
                     if let Some(col) = err_text
                         .split("column ")
@@ -5277,8 +5282,10 @@ fn parse_incoming_tool_call(
                     }
                     Err(e2) => {
                         log::warn!(
-                            "[byop] from_args failed (after coerce): tool={} err={e2:#} original_err={e:#} coerced_args={coerced} args_str={args_str}",
-                            call.fn_name
+                            "[byop] from_args failed (after coerce): tool={} err={e2:#} original_err={e:#} coerced_args={} args_str={}",
+                            call.fn_name,
+                            snippet_for_log(&coerced, FAILED_ARGS_LOG_CHARS),
+                            snippet_for_log(&args_str, FAILED_ARGS_LOG_CHARS)
                         );
                         return Err(e2);
                     }
@@ -5290,8 +5297,9 @@ fn parse_incoming_tool_call(
             //   2. 是否 genai Value→string 转换中 escape 出问题
             //   3. 是否 fn_arguments 整段被字符串化(应该 object 却是 string)
             log::warn!(
-                "[byop] from_args failed: tool={} err={e:#} args_str={args_str}",
-                call.fn_name
+                "[byop] from_args failed: tool={} err={e:#} args_str={}",
+                call.fn_name,
+                snippet_for_log(&args_str, FAILED_ARGS_LOG_CHARS)
             );
             Err(e)
         }
