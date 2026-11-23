@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: removed the Windows-specific log level and log directory; renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: removed the Windows-specific log level and log directory; renamed the Warp and Zap names to ZapNG; added the limit on the total size of the log files.
 
 use std::path::{Path, PathBuf};
 use std::{
@@ -24,6 +24,8 @@ const MAX_FILES_IN_GUI_ROTATION: usize = 5;
 const MAX_FILES_IN_CLI_ROTATION: usize = 10;
 const CLI_LOG_SUBDIRECTORY: &str = "oz";
 const TEMP_LOG_FILE_SUFFIX: &str = "old.temp";
+/// The most files of one execution kept under a total size limit, however small the files.
+const MAX_IN_SESSION_ROTATION: usize = 1024;
 
 /// Runtime logging state, computed from `LogConfig` during initialization.
 #[derive(Debug)]
@@ -37,6 +39,9 @@ struct LogState {
 
     /// The maximum number of backup log files to keep during rotation.
     max_rotation: usize,
+
+    /// The disk space the rotated log files may take together, if limited.
+    max_rotated_bytes: Option<u64>,
 }
 
 static LOG_STATE: OnceLock<LogState> = OnceLock::new();
@@ -147,6 +152,36 @@ pub async fn rotate_log_files() {
 
     if let Err(err) = rotate_files(&ChannelState::logfile_name(), max_rotation).await {
         log::error!("Failed to rotate log files: {err:?}");
+    }
+
+    if let Some(max_rotated_bytes) = config.max_rotated_bytes {
+        prune_rotated_logs(
+            &config.log_directory,
+            &ChannelState::logfile_name(),
+            max_rotated_bytes,
+        );
+    }
+}
+
+/// Deletes the oldest rotated log files, those of earlier executions included, until the rest
+/// takes at most `max_rotated_bytes`. The active file is never deleted.
+///
+/// This runs while a log record is being written, so it must not log.
+pub(crate) fn prune_rotated_logs(log_directory: &Path, logfile_name: &str, max_rotated_bytes: u64) {
+    // Newest first.
+    let Ok(files) = collect_log_paths_in(log_directory, logfile_name) else {
+        return;
+    };
+    let active = log_directory.join(logfile_name);
+    let mut kept_bytes = 0u64;
+    for file in files.into_iter().filter(|file| *file != active) {
+        let size = fs::metadata(&file)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        kept_bytes = kept_bytes.saturating_add(size);
+        if kept_bytes > max_rotated_bytes {
+            let _ = fs::remove_file(file);
+        }
     }
 }
 
@@ -283,6 +318,7 @@ pub fn init_for_crash_recovery_process() -> Result<()> {
         false, /* is_cli */
         None,  /* log_destination */
         None,  /* max_file_size_bytes — crash recovery uses its own short-lived log */
+        None,  /* max_total_size_bytes */
     )
 }
 
@@ -296,6 +332,7 @@ pub fn init(config: LogConfig) -> Result<()> {
         config.is_cli,
         config.log_destination,
         config.max_file_size_bytes,
+        config.max_total_size_bytes,
     )
 }
 
@@ -623,6 +660,7 @@ fn init_internal(
     is_cli: bool,
     log_destination: Option<LogDestination>,
     max_file_size_bytes: Option<u64>,
+    max_total_size_bytes: Option<u64>,
 ) -> Result<()> {
     /// Returns an empty file named `zap-ng.log` to log the current execution, and
     /// renames the previous execution's log to a temporary name.
@@ -685,6 +723,20 @@ fn init_internal(
         MAX_FILES_IN_GUI_ROTATION
     };
 
+    // The rotated files get what the total leaves once the active file is full.
+    let max_file_size_bytes = max_file_size_bytes.filter(|size| *size > 0);
+    let max_rotated_bytes = max_total_size_bytes
+        .filter(|total| *total > 0)
+        .map(|total| total.saturating_sub(max_file_size_bytes.unwrap_or(0)));
+    // With a total, it alone decides how many of this execution's files stay: give the
+    // writer as many slots as files of the configured size fit in it.
+    let max_in_session_rotation = match (max_file_size_bytes, max_rotated_bytes) {
+        (Some(file_size), Some(rotated)) => usize::try_from(rotated.div_ceil(file_size))
+            .unwrap_or(MAX_IN_SESSION_ROTATION)
+            .min(MAX_IN_SESSION_ROTATION),
+        _ => max_rotation,
+    };
+
     let mut log_directory = init_log_directory()?;
     if is_cli {
         log_directory = log_directory.join(CLI_LOG_SUBDIRECTORY);
@@ -704,7 +756,8 @@ fn init_internal(
                 &log_directory,
                 &ChannelState::logfile_name(),
                 max_file_size_bytes,
-                max_rotation,
+                max_in_session_rotation,
+                max_rotated_bytes,
             )?
         };
         base_logger.target(env_logger::Target::Pipe(target));
@@ -732,6 +785,7 @@ fn init_internal(
             use_logfile,
             log_directory,
             max_rotation,
+            max_rotated_bytes,
         })
         .expect("Logging already initialized");
     // We can .expect here because .init would have already panicked if we initialized logging twice.
@@ -986,7 +1040,10 @@ mod tests {
         shift_old_session_in_session_chunks(tmp.path(), "zap-ng.log", 0);
 
         assert!(tmp.path().join("zap-ng.log.old.1.in_session.0").is_file());
-        assert_eq!(tmp.path().join("zap-ng.log.old.1.in_session.0"), slot1_chunk);
+        assert_eq!(
+            tmp.path().join("zap-ng.log.old.1.in_session.0"),
+            slot1_chunk
+        );
     }
 
     #[test]
@@ -1002,5 +1059,61 @@ mod tests {
         assert!(!tmp.path().join("zap-ng.log.old.4.in_session.1").exists());
         // Other slots' chunks are untouched.
         assert!(survivor.is_file());
+    }
+
+    fn write(dir: &Path, name: &str, len: usize) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, vec![b'x'; len]).unwrap();
+        path
+    }
+
+    #[test]
+    fn prune_deletes_the_oldest_files_beyond_the_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = write(tmp.path(), "zap-ng.log", 1000);
+        let in_session_0 = write(tmp.path(), "zap-ng.log.in_session.0", 40);
+        let in_session_1 = write(tmp.path(), "zap-ng.log.in_session.1", 40);
+        let old_0 = write(tmp.path(), "zap-ng.log.old.0", 40);
+        let old_0_chunk = write(tmp.path(), "zap-ng.log.old.0.in_session.0", 40);
+        let old_1 = write(tmp.path(), "zap-ng.log.old.1", 40);
+
+        prune_rotated_logs(tmp.path(), "zap-ng.log", 100);
+
+        // The active file doesn't count and stays; the two newest rotated files fit.
+        assert!(active.is_file());
+        assert!(in_session_0.is_file());
+        assert!(in_session_1.is_file());
+        assert!(!old_0.exists());
+        assert!(!old_0_chunk.exists());
+        assert!(!old_1.exists());
+    }
+
+    #[test]
+    fn prune_keeps_everything_within_the_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let in_session_0 = write(tmp.path(), "zap-ng.log.in_session.0", 40);
+        let old_0 = write(tmp.path(), "zap-ng.log.old.0", 60);
+        let other = write(tmp.path(), "zap-ng-preview.log.old.0", 500);
+
+        prune_rotated_logs(tmp.path(), "zap-ng.log", 100);
+
+        assert!(in_session_0.is_file());
+        assert!(old_0.is_file());
+        assert!(other.is_file());
+    }
+
+    #[test]
+    fn prune_deletes_every_file_older_than_one_over_the_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let in_session_0 = write(tmp.path(), "zap-ng.log.in_session.0", 40);
+        let old_0 = write(tmp.path(), "zap-ng.log.old.0", 500);
+        let old_1 = write(tmp.path(), "zap-ng.log.old.1", 10);
+
+        prune_rotated_logs(tmp.path(), "zap-ng.log", 100);
+
+        // A small file older than a deleted one goes too: the kept files are a run of the newest.
+        assert!(in_session_0.is_file());
+        assert!(!old_0.exists());
+        assert!(!old_1.exists());
     }
 }

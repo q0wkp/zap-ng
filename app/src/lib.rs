@@ -674,6 +674,17 @@ pub fn run_integration_test(driver: TestDriver) -> Result<()> {
     run_internal(launch)
 }
 
+/// The logging configuration, with the size limits `zap-ng.toml` gives.
+fn log_config(is_cli: bool, log_destination: Option<LogDestination>) -> zap_ng_logging::LogConfig {
+    let limits = settings::zap_ng_file::LogLimits::read();
+    zap_ng_logging::LogConfig {
+        is_cli,
+        log_destination,
+        max_file_size_bytes: Some(limits.max_file_size_bytes),
+        max_total_size_bytes: Some(limits.max_total_size_bytes),
+    }
+}
+
 /// Shared early initialization for **every** process type (app, CLI, proxy,
 /// daemon).  Every step in this function runs for all modes, including
 /// lightweight ones like Proxy.  Think carefully before adding here — if
@@ -700,18 +711,10 @@ fn init_common(launch_mode: &LaunchMode, timer: Option<&mut IntervalTimer>) -> R
             if crash_recovery::is_crash_recovery_process(launch_mode.args().as_ref()) {
                 zap_ng_logging::init_for_crash_recovery_process()?;
             } else {
-                zap_ng_logging::init(zap_ng_logging::LogConfig {
-                    is_cli,
-                    log_destination,
-                    ..Default::default()
-                })?;
+                zap_ng_logging::init(log_config(is_cli, log_destination))?;
             }
         } else {
-            zap_ng_logging::init(zap_ng_logging::LogConfig {
-                is_cli,
-                log_destination,
-                ..Default::default()
-            })?;
+            zap_ng_logging::init(log_config(is_cli, log_destination))?;
         }
     }
 

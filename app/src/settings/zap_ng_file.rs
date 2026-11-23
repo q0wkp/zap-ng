@@ -139,3 +139,70 @@ pub const ZAP_NG_SETTINGS: &[Route] = &[
 pub fn zap_ng_settings_file_path() -> PathBuf {
     zap_ng_core::paths::config_local_dir().join("zap-ng.toml")
 }
+
+/// The limits on the log files' size, from the `[logging]` table of `zap-ng.toml`:
+///
+/// ```toml
+/// [logging]
+/// max_file_size_mb = 50
+/// max_total_size_mb = 500
+/// ```
+///
+/// They are read once, before logging starts, so a change takes effect at the next start.
+/// Zero turns a limit off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogLimits {
+    /// The size the log file is rotated at while running.
+    pub max_file_size_bytes: u64,
+    /// The disk space the log files may take together.
+    pub max_total_size_bytes: u64,
+}
+
+impl Default for LogLimits {
+    fn default() -> Self {
+        Self {
+            max_file_size_bytes: zap_ng_logging::DEFAULT_MAX_FILE_SIZE_BYTES,
+            max_total_size_bytes: zap_ng_logging::DEFAULT_MAX_TOTAL_SIZE_BYTES,
+        }
+    }
+}
+
+impl LogLimits {
+    /// Reads the limits from `zap-ng.toml`. Whatever is missing or can't be read keeps its
+    /// default: logging hasn't started, so there is nowhere to report it.
+    pub fn read() -> Self {
+        std::fs::read_to_string(zap_ng_settings_file_path())
+            .map(|text| Self::parse(&text))
+            .unwrap_or_default()
+    }
+
+    fn parse(text: &str) -> Self {
+        const BYTES_PER_MB: u64 = 1024 * 1024;
+
+        let mut limits = Self::default();
+        let Ok(table) = text.parse::<toml::Table>() else {
+            return limits;
+        };
+        let Some(logging) = table.get("logging").and_then(toml::Value::as_table) else {
+            return limits;
+        };
+        let megabytes = |key: &str| {
+            logging
+                .get(key)
+                .and_then(toml::Value::as_integer)
+                .and_then(|megabytes| u64::try_from(megabytes).ok())
+                .map(|megabytes| megabytes.saturating_mul(BYTES_PER_MB))
+        };
+        if let Some(bytes) = megabytes("max_file_size_mb") {
+            limits.max_file_size_bytes = bytes;
+        }
+        if let Some(bytes) = megabytes("max_total_size_mb") {
+            limits.max_total_size_bytes = bytes;
+        }
+        limits
+    }
+}
+
+#[cfg(test)]
+#[path = "zap_ng_file_test.rs"]
+mod tests;

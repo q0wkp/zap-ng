@@ -29,6 +29,9 @@ pub(crate) struct RotatingFileWriter {
     base_file_name: String,
     max_bytes: u64,
     max_rotation: usize,
+    /// The disk space the rotated files may take together; the oldest beyond it are deleted
+    /// after each rotation.
+    max_rotated_bytes: Option<u64>,
     bytes_written: u64,
     file: File,
 }
@@ -55,9 +58,17 @@ impl RotatingFileWriter {
             base_file_name,
             max_bytes,
             max_rotation,
+            max_rotated_bytes: None,
             bytes_written: 0,
             file,
         })
+    }
+
+    /// Limits the disk space the rotated files take together, those of earlier executions
+    /// included.
+    pub(crate) fn with_max_rotated_bytes(mut self, max_rotated_bytes: Option<u64>) -> Self {
+        self.max_rotated_bytes = max_rotated_bytes;
+        self
     }
 
     fn in_session_path(&self, index: usize) -> PathBuf {
@@ -110,6 +121,13 @@ impl RotatingFileWriter {
             .truncate(true)
             .open(self.active_path())?;
         self.bytes_written = 0;
+        if let Some(max_rotated_bytes) = self.max_rotated_bytes {
+            crate::imp::prune_rotated_logs(
+                &self.log_directory,
+                &self.base_file_name,
+                max_rotated_bytes,
+            );
+        }
         Ok(())
     }
 }
@@ -152,6 +170,7 @@ pub(crate) fn wrap_for_rotation(
     base_file_name: &str,
     max_file_size_bytes: Option<u64>,
     max_rotation: usize,
+    max_rotated_bytes: Option<u64>,
 ) -> io::Result<Box<dyn Write + Send + 'static>> {
     match max_file_size_bytes {
         Some(max_bytes) if max_bytes > 0 => {
@@ -165,7 +184,8 @@ pub(crate) fn wrap_for_rotation(
                 base_file_name.to_string(),
                 max_bytes,
                 max_rotation,
-            )?;
+            )?
+            .with_max_rotated_bytes(max_rotated_bytes);
             Ok(Box::new(writer))
         }
         _ => Ok(Box::new(file)),
@@ -310,5 +330,35 @@ mod tests {
         w.flush().unwrap();
         assert!(!tmp.path().join("zap-ng.log.in_session.0").exists());
         assert_eq!(read(&tmp.path().join("zap-ng.log")).len(), 500);
+    }
+
+    #[test]
+    fn rotation_deletes_the_oldest_files_beyond_the_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An earlier execution's file, older than whatever this one rotates out.
+        std::fs::write(tmp.path().join("zap-ng.log.old.0"), "previous\n").unwrap();
+        let mut w = RotatingFileWriter::open(tmp.path(), "zap-ng.log", 8, 10)
+            .unwrap()
+            .with_max_rotated_bytes(Some(20));
+        w.write_all(b"aaaaaaaaa\n").unwrap();
+        w.write_all(b"bbbbbbbbb\n").unwrap();
+        // Rotated: 10 bytes, with the earlier execution's 9 within the 20.
+        assert!(tmp.path().join("zap-ng.log.old.0").is_file());
+        w.write_all(b"ccccccccc\n").unwrap();
+        w.flush().unwrap();
+        // Rotated: 20 bytes, so the earlier execution's file is deleted.
+        assert_eq!(read(&tmp.path().join("zap-ng.log")), "ccccccccc\n");
+        assert_eq!(
+            read(&tmp.path().join("zap-ng.log.in_session.0")),
+            "bbbbbbbbb\n"
+        );
+        assert_eq!(
+            read(&tmp.path().join("zap-ng.log.in_session.1")),
+            "aaaaaaaaa\n"
+        );
+        assert!(!tmp.path().join("zap-ng.log.old.0").exists());
+        w.write_all(b"ddddddddd\n").unwrap();
+        w.flush().unwrap();
+        assert!(!tmp.path().join("zap-ng.log.in_session.2").exists());
     }
 }

@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2026 The Zap Authors (https://github.com/zerx-lab/zap)
 // SPDX-FileCopyrightText: 2026 Tianyu (Sky) Lu
 // SPDX-License-Identifier: AGPL-3.0-only
-// Modified by Tianyu (Sky) Lu in 2026: renamed the Warp and Zap names to ZapNG.
+// Modified by Tianyu (Sky) Lu in 2026: renamed the Warp and Zap names to ZapNG; added the limit on the
+// total size of the log files.
 
 /// Destination for log output.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,7 +29,18 @@ pub struct LogConfig {
     /// `rotate_log_files` behavior. `None` preserves the existing unbounded-within-session
     /// growth (Warp issue 10879).
     pub max_file_size_bytes: Option<u64>,
+    /// Optional limit on the disk space the log files take together: the active file, the
+    /// files rotated out of it while running and the files of earlier executions. After each
+    /// rotation the oldest files are deleted until the rest, with a full active file, fits.
+    /// `None` leaves only the number of files limited.
+    pub max_total_size_bytes: Option<u64>,
 }
+
+/// The size a log file is rotated at where nothing else is configured.
+pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// The disk space the log files may take together where nothing else is configured.
+pub const DEFAULT_MAX_TOTAL_SIZE_BYTES: u64 = 500 * 1024 * 1024;
 
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 #[cfg_attr(target_family = "wasm", path = "wasm.rs")]
