@@ -81,6 +81,10 @@ pub struct InlineDiffView {
     session_type: Option<DiffSessionType>,
     #[cfg(not(target_family = "wasm"))]
     persistence: PersistenceState,
+    /// The file's content before the diff, exactly as it was read. A restore writes this back,
+    /// since the diff base the editor holds has its line endings normalized to LF.
+    #[cfg(not(target_family = "wasm"))]
+    original_content: Option<String>,
 }
 
 impl InlineDiffView {
@@ -114,6 +118,8 @@ impl InlineDiffView {
             session_type: None,
             #[cfg(not(target_family = "wasm"))]
             persistence: PersistenceState::Unpersisted,
+            #[cfg(not(target_family = "wasm"))]
+            original_content: None,
         };
 
         model.apply_diffs_if_any(ctx);
@@ -164,6 +170,13 @@ impl InlineDiffView {
 
         self.session_type = Some(session_type.clone());
         self.finish_file_registration(file_id, ctx);
+    }
+
+    /// Records the file's content before the diff, as it was read, for
+    /// [`Self::restore_and_save_diff`] to write back unchanged.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn set_original_content(&mut self, content: String) {
+        self.original_content = Some(content);
     }
 
     /// Sets the backing file ID and initial version after registration.
@@ -345,8 +358,12 @@ impl InlineDiffView {
                     file_model.update(ctx, |model, ctx| model.delete(file_id, version, ctx))
                 }
                 diff => {
+                    // The editor's diff base is normalized to LF, which would rewrite the
+                    // line endings of a CRLF or mixed file; prefer the content as it was read.
                     let base_content = self
-                        .base_content(ctx)
+                        .original_content
+                        .clone()
+                        .or_else(|| self.base_content(ctx))
                         .ok_or_else(|| "Missing base content".to_owned())?;
                     match diff {
                         Some(DiffType::Delete { .. })

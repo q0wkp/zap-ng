@@ -154,6 +154,65 @@ fn restore_deleted_file_recreates_original_content() {
     });
 }
 
+/// A file with CRLF, lone LF and lone CR line endings, which the editor's LF diff base cannot
+/// hold.
+const MIXED_LINE_ENDINGS: &str = "first\r\nsecond\nthird\r\nlast\r";
+
+#[test]
+fn restore_updated_file_keeps_original_line_endings() {
+    App::test((), |mut app| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.txt");
+        fs::write(&path, MIXED_LINE_ENDINGS).unwrap();
+        let view = add_diff(
+            &mut app,
+            &path,
+            MIXED_LINE_ENDINGS,
+            DiffType::update(
+                vec![DiffDelta {
+                    replacement_line_range: 2..3,
+                    insertion: "changed\n".to_owned(),
+                }],
+                None,
+            ),
+        );
+        view.update(&mut app, |view, ctx| {
+            view.set_original_content(MIXED_LINE_ENDINGS.to_owned());
+            view.accept_and_save_diff(ctx)
+        })
+        .unwrap()
+        .await
+        .unwrap();
+        assert_ne!(fs::read(&path).unwrap(), MIXED_LINE_ENDINGS.as_bytes());
+
+        restore(&mut app, &view).await;
+
+        assert_eq!(fs::read(&path).unwrap(), MIXED_LINE_ENDINGS.as_bytes());
+    });
+}
+
+#[test]
+fn restore_deleted_file_keeps_original_line_endings() {
+    App::test((), |mut app| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deleted-mixed.txt");
+        fs::write(&path, MIXED_LINE_ENDINGS).unwrap();
+        let view = add_diff(&mut app, &path, MIXED_LINE_ENDINGS, DiffType::deletion(4));
+        view.update(&mut app, |view, ctx| {
+            view.set_original_content(MIXED_LINE_ENDINGS.to_owned());
+            view.accept_and_save_diff(ctx)
+        })
+        .unwrap()
+        .await
+        .unwrap();
+        assert!(!path.exists());
+
+        restore(&mut app, &view).await;
+
+        assert_eq!(fs::read(&path).unwrap(), MIXED_LINE_ENDINGS.as_bytes());
+    });
+}
+
 #[test]
 fn restore_moved_file_restores_original_path_and_content() {
     App::test((), |mut app| async move {

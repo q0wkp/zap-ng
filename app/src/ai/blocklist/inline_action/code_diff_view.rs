@@ -943,7 +943,11 @@ impl CodeDiffView {
                 #[cfg(not(target_family = "wasm"))]
                 {
                     let session_type = &self.diff_session_type;
-                    diff_viewer.update(ctx, |view, ctx| view.register_file(session_type, ctx));
+                    let original_content = diff.base.content;
+                    diff_viewer.update(ctx, |view, ctx| {
+                        view.set_original_content(original_content);
+                        view.register_file(session_type, ctx)
+                    });
                 }
 
                 self.setup_diff_view_subscriptions(&diff_viewer, file_path, ctx);
