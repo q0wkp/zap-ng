@@ -2501,6 +2501,8 @@ rewind-dialog-body = 确定要倒回吗？这会将你的代码和对话恢复�
 rewind-dialog-info = 倒回不会影响手动编辑或通过 shell 命令编辑的文件。
 rewind-dialog-cancel = 取消
 rewind-dialog-confirm = 倒回
+rewind-toast-incomplete = 倒回未完成：部分文件修改没能还原。对话已保留，可以再倒回一次。
+rewind-toast-in-progress = 对话正在倒回。草稿和排队的提示词都已保留，倒回完成后再发送。
 # Multi-line command confirmation dialog (app/src/workspace/multiline_command_confirmation_dialog.rs)
 multiline-command-dialog-title = 将 { $count } 行作为单独的命令运行？
 multiline-command-dialog-body = 此 shell 未使用括号粘贴模式（bracketed paste），因此会把每一行当作单独的命令依次运行。

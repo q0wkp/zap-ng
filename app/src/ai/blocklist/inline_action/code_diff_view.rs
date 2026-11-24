@@ -1129,6 +1129,32 @@ impl CodeDiffView {
         )
     }
 
+    /// Reverts the changes as one step of rewinding the conversation, resolving once every file
+    /// is restored.
+    ///
+    /// Unlike the revert button, which does nothing while a save or another revert is running,
+    /// this fails then: the rewind must not go on to truncate the conversation over a diff whose
+    /// files were left as they are. A diff that was never applied, or is already reverted, has
+    /// nothing to restore.
+    pub fn revert_changes_for_rewind(&mut self, ctx: &mut ViewContext<Self>) -> SaveFuture {
+        if !matches!(self.state, CodeDiffState::Accepted) {
+            return futures::future::ready(Ok(())).boxed();
+        }
+        let busy = if self.pending_saves > 0 {
+            Some("The file edits are still being saved")
+        } else if self.revert_in_progress {
+            Some("The file edits are already being reverted")
+        } else {
+            None
+        };
+        if let Some(reason) = busy {
+            return futures::future::ready(Err(Arc::new(FileSaveError::Other(reason.to_owned()))))
+                .boxed();
+        }
+        self.revert_changes(ctx)
+            .unwrap_or_else(|| futures::future::ready(Ok(())).boxed())
+    }
+
     fn mark_action_as_reverted(&self, ctx: &mut ViewContext<Self>) {
         if let Some(conversation_id) = self.identifiers.client_conversation_id {
             let action_id = self.action_id.clone();

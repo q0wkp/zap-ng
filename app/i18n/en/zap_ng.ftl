@@ -2575,6 +2575,8 @@ rewind-dialog-body = Are you sure you want to rewind? This will restore your cod
 rewind-dialog-info = Rewinding does not affect files edited manually or via shell commands.
 rewind-dialog-cancel = Cancel
 rewind-dialog-confirm = Rewind
+rewind-toast-incomplete = Rewind did not finish: some file edits could not be reverted. The conversation was kept, so you can rewind again.
+rewind-toast-in-progress = The conversation is being rewound. Your draft and queued prompts are kept; send again once it is done.
 # Multi-line command confirmation dialog (app/src/workspace/multiline_command_confirmation_dialog.rs)
 multiline-command-dialog-title = Run { $count } lines as separate commands?
 multiline-command-dialog-body = This shell isn't using bracketed paste, so it will run each line as its own command, one after another.

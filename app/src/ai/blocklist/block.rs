@@ -220,7 +220,7 @@ use super::{
     action_model::{AIActionStatus, BlocklistAIActionEvent, RequestFileEditsFormatKind},
     code_block::CodeSnippetButtonHandles,
     inline_action::code_diff_view::{
-        CodeDiffState, CodeDiffView, CodeDiffViewAction, CodeDiffViewEvent,
+        CodeDiffState, CodeDiffView, CodeDiffViewEvent,
     },
     inline_action::requested_command_attribution::is_command_copied_from_document,
     permissions::is_agent_mode_autonomy_allowed,
@@ -3678,13 +3678,14 @@ impl AIBlock {
         self.client_ids.conversation_id
     }
 
-    /// Reverts all file diffs (CodeDiffViews) in this AIBlock, from newest to oldest (order matters)
-    pub fn revert_all_diffs(&mut self, ctx: &mut ViewContext<Self>) {
-        for edit in self.requested_edits.values().rev() {
-            edit.view.update(ctx, |diff_view, ctx| {
-                diff_view.handle_action(&CodeDiffViewAction::RevertChanges, ctx);
-            });
-        }
+    /// The file diffs (CodeDiffViews) in this AIBlock, from newest to oldest: the order a rewind
+    /// reverts them in, since a later diff may build on an earlier one of the same file.
+    pub fn diff_views_newest_first(&self) -> Vec<ViewHandle<CodeDiffView>> {
+        self.requested_edits
+            .values()
+            .rev()
+            .map(|edit| edit.view.clone())
+            .collect()
     }
 
     pub fn response_stream_id(&self) -> Option<&ResponseStreamId> {

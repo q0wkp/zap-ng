@@ -118,6 +118,16 @@ impl TerminalView {
     /// status stays `InProgress` across the cancel+resend (see `mark_request_cancelled`
     /// in `conversation.rs`), keeping the warping indicator visible throughout.
     fn send_queued_prompt_now(&mut self, prompt: String, ctx: &mut ViewContext<Self>) {
+        // Nothing may be sent to a conversation being rewound: keep the prompt queued.
+        let rewind_in_progress = self
+            .ai_context_model
+            .as_ref(ctx)
+            .selected_conversation_id(ctx)
+            .is_some_and(|id| self.ai_controller.as_ref(ctx).is_rewind_in_progress(id));
+        if rewind_in_progress {
+            self.show_error_toast(crate::t!("rewind-toast-in-progress"), ctx);
+            return;
+        }
         self.remove_pending_user_query_block(ctx);
         if let Some(conversation_id) = self
             .ai_context_model

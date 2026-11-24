@@ -11754,7 +11754,8 @@ impl Input {
                 view.accept_selected_item(false, ctx);
             });
             return;
-        } else if self.maybe_queue_input_for_in_progress_conversation(ctx)
+        } else if self.refuse_ai_submission_during_rewind(ctx)
+            || self.maybe_queue_input_for_in_progress_conversation(ctx)
             || self.maybe_handle_enter_for_slash_command(ctx)
         {
             return;
@@ -12320,6 +12321,38 @@ impl Input {
     /// on and the active conversation is still in progress.
     /// Only queues when AI input is active — if the user is in shell mode the
     /// input is not queued (so e.g. `ls` still runs in the terminal).
+    /// Refuses an AI submission from the input while the selected conversation is being rewound,
+    /// leaving the draft and its attachments in place. Shell commands are not held back.
+    fn refuse_ai_submission_during_rewind(&self, ctx: &mut ViewContext<Self>) -> bool {
+        if !self.ai_input_model.as_ref(ctx).is_ai_input_enabled() {
+            return false;
+        }
+        let Some(conversation_id) = self
+            .ai_context_model
+            .as_ref(ctx)
+            .selected_conversation_id(ctx)
+        else {
+            return false;
+        };
+        if !self
+            .ai_controller
+            .as_ref(ctx)
+            .is_rewind_in_progress(conversation_id)
+        {
+            return false;
+        }
+        // The history is about to be truncated, and what is sent now would go with it.
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(
+                DismissibleToast::error(crate::t!("rewind-toast-in-progress")),
+                window_id,
+                ctx,
+            );
+        });
+        true
+    }
+
     fn maybe_queue_input_for_in_progress_conversation(
         &mut self,
         ctx: &mut ViewContext<Self>,
