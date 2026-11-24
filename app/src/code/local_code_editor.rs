@@ -16,6 +16,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 
 use pathfinder_geometry::vector::Vector2F;
@@ -63,8 +64,6 @@ use pathfinder_color::ColorU;
 use vim::vim::{MotionType, VimMode};
 use zap_ng_core::ui::icons::Icon;
 
-use crate::workspace::WorkspaceAction;
-
 const DROP_SHADOW_COLOR: ColorU = ColorU {
     r: 0,
     g: 0,
@@ -97,7 +96,7 @@ pub enum LocalCodeEditorEvent {
     },
     FileSaved,
     FailedToSave {
-        error: Rc<FileSaveError>,
+        error: Arc<FileSaveError>,
     },
     DiffAccepted,
     DiffRejected,
@@ -207,7 +206,7 @@ impl LocalCodeEditorView {
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         ctx.subscribe_to_view(&editor, |me, _, event, ctx| match event {
-            CodeEditorEvent::UnifiedDiffComputed(_) => {
+            CodeEditorEvent::UnifiedDiffComputed => {
                 ctx.emit(LocalCodeEditorEvent::DiffAccepted);
             }
             CodeEditorEvent::ContentChanged { origin, .. } => {
@@ -339,7 +338,7 @@ impl LocalCodeEditorView {
         if let Err(err) = result {
             log::error!("Failed to save file: {err:?}");
             ctx.emit(LocalCodeEditorEvent::FailedToSave {
-                error: Rc::new(err),
+                error: Arc::new(err),
             });
         }
     }
@@ -678,7 +677,7 @@ impl LocalCodeEditorView {
             }) {
             log::error!("Failed to save file to new path: {err:?}");
             ctx.emit(LocalCodeEditorEvent::FailedToSave {
-                error: Rc::new(err),
+                error: Arc::new(err),
             });
             SaveOutcome::Failed
         } else {
@@ -957,67 +956,8 @@ impl DiffViewer for LocalCodeEditorView {
         self.was_edited
     }
 
-    /// Automatically accept and save this diff. Unlike [`Self::accept_diff`] and [`Self::save_local`], this
-    /// waits for the initial file contents to be loaded.
-    fn accept_and_save_diff(&self, ctx: &mut ViewContext<Self>) {
-        ctx.spawn(self.file_loaded.wait(), move |me, _, ctx| {
-            me.accept_diff(ctx);
-            if let Err(err) = me.save_local(ctx) {
-                log::error!("{err:?}");
-                if let ImmediateSaveError::FailedToSave(err) = err {
-                    ctx.emit(LocalCodeEditorEvent::FailedToSave {
-                        error: Rc::new(err),
-                    });
-                }
-            }
-        });
-    }
-
     fn reject_diff(&mut self, ctx: &mut ViewContext<Self>) {
         ctx.emit(LocalCodeEditorEvent::DiffRejected);
-    }
-
-    fn restore_diff_base(&mut self, ctx: &mut ViewContext<Self>) -> Result<(), String> {
-        if self.is_new_file {
-            if let Some(file_id) = self.file_id() {
-                GlobalBufferModel::handle(ctx).update(ctx, |model, ctx| {
-                    model.remove(file_id, ctx);
-                });
-            }
-            if let Some(path) = self.file_path().map(|p| p.to_path_buf()) {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    log::error!("Failed to delete file after save: {e}");
-                } else {
-                    // This will close tabs with the file open
-                    ctx.dispatch_typed_action(&WorkspaceAction::FileDeleted { path });
-                }
-            }
-
-            return Ok(());
-        }
-
-        let base_content = self
-            .editor
-            .as_ref(ctx)
-            .model
-            .as_ref(ctx)
-            .diff()
-            .as_ref(ctx)
-            .base()
-            .ok_or_else(|| "Missing base content".to_string())?
-            .to_string();
-
-        let file_id = self
-            .file_id()
-            .ok_or_else(|| "Missing file_id".to_string())?;
-
-        let buffer_version = self.editor.as_ref(ctx).version(ctx);
-
-        GlobalBufferModel::handle(ctx)
-            .update(ctx, |model, ctx| {
-                model.save(file_id, base_content, buffer_version, ctx)
-            })
-            .map_err(|e| format!("Failed to save file: {e:?}"))
     }
 }
 
@@ -1111,7 +1051,7 @@ impl TypedActionView for LocalCodeEditorView {
                 if let Err(ImmediateSaveError::FailedToSave(err)) = self.save_local(ctx) {
                     log::error!("Failed to save file {err:?}");
                     ctx.emit(LocalCodeEditorEvent::FailedToSave {
-                        error: Rc::new(err),
+                        error: Arc::new(err),
                     });
                 };
             }

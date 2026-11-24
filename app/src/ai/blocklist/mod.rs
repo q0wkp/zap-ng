@@ -5,6 +5,8 @@ pub mod block;
 pub mod code_block;
 mod context_model;
 mod controller;
+pub(crate) mod diff_storage;
+pub(crate) mod diff_types;
 mod passive_suggestions;
 pub(super) use controller::RequestInput;
 pub mod history_model;

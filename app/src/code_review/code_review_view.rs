@@ -504,7 +504,7 @@ pub enum CodeReviewViewEvent {
     },
     FileSaveError {
         path: PathBuf,
-        error: Rc<FileSaveError>,
+        error: Arc<FileSaveError>,
     },
     #[cfg(feature = "local_fs")]
     OpenFileWithTarget {

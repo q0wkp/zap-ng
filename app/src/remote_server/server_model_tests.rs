@@ -232,3 +232,6 @@ fn create_directory_creates_nested_directories() {
     ));
     assert!(nested.is_dir());
 }
+
+#[path = "file_operation_tests.rs"]
+mod file_operations;

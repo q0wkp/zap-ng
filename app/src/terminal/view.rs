@@ -98,6 +98,8 @@ use crate::ai::blocklist::usage::conversation_usage_view::{
     ConversationUsageInfo, ConversationUsageView, DisplayMode, TimingInfo,
 };
 use crate::ai::blocklist::{block_context_from_terminal_model, SlashCommandRequest};
+use crate::ai::blocklist::diff_storage::DiffStorageHelper;
+use crate::ai::blocklist::diff_types::FileDiff;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel, AIDocumentVersion};
 use crate::ai::loading::shimmering_zap_ng_loading_text;
 #[cfg(feature = "local_fs")]
@@ -206,7 +208,7 @@ use crate::ai::{
     blocklist::{
         ai_brand_color, get_ai_block_overflow_menu_element_position_id,
         get_attached_blocks_chip_element_position_id,
-        inline_action::code_diff_view::{CodeDiffView, FileDiff},
+        inline_action::code_diff_view::CodeDiffView,
         summarization_cancel_dialog::SummarizationCancelDialog,
         telemetry_banner::should_collect_ai_ugc_telemetry,
         AIBlock, AIBlockEvent, BlocklistAIActionEvent, BlocklistAIActionModel,
@@ -350,7 +352,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 use std::ops::Range;
@@ -2772,6 +2774,16 @@ pub struct TerminalView {
     remote_server_shimmer_handle: ShimmeringTextStateHandle,
 }
 
+/// A rewind of a conversation whose file edits are still being reverted.
+struct PendingRewind {
+    /// The exchange the conversation is truncated from once every edit is reverted.
+    exchange_id: AIAgentExchangeId,
+    conversation_id: AIConversationId,
+    /// The diffs left to revert, newest first.
+    diff_views: VecDeque<ViewHandle<CodeDiffView>>,
+    num_blocks_reverted: usize,
+}
+
 /// Parameters stashed when a code review pane open is requested with
 /// [`GitDeltaPreference::OnlyDirty`] but git status metadata is not yet available.
 /// Consumed once the per-repo [`GitRepoStatusModel`] delivers its first update.
@@ -4608,7 +4620,21 @@ impl TerminalView {
             }
 
             if let Some(reason) = finish_reason {
-                let queued_prompt = self.queued_prompt_callback.take();
+                // A rewind cancels the conversation first. Its queued prompt stays queued:
+                // firing it now would put it back into the input over the draft, or drop it
+                // when the input is not empty.
+                let queued_prompt_is_held_by_rewind =
+                    match self.pending_user_query_conversation_id() {
+                        Some(id) => self.ai_controller.as_ref(ctx).is_rewind_in_progress(id),
+                        // Without its block there is no telling which conversation the queued
+                        // prompt is for.
+                        None => self.ai_controller.as_ref(ctx).is_any_rewind_in_progress(),
+                    };
+                let queued_prompt = if queued_prompt_is_held_by_rewind {
+                    None
+                } else {
+                    self.queued_prompt_callback.take()
+                };
                 let callbacks = self
                     .conversation_completed_callbacks
                     .drain(..)
@@ -13037,11 +13063,15 @@ impl TerminalView {
         ctx.subscribe_to_view(&diff_view, move |me, view, event, ctx| {
             match event {
                 CodeDiffViewEvent::TryAccept => {
-                    view.update(ctx, |diff_view, ctx| {
-                        diff_view.accept_and_save(ctx);
+                    // Persist the accepted (possibly edited) passive suggestion
+                    // through the shared DiffStorageHelper flow. The result
+                    // isn't surfaced to the LLM on this path; failed writes
+                    // surface per-file toasts from the view's save
+                    // subscriptions.
+                    let _save_future = view.update(ctx, |diff_view, ctx| {
+                        diff_view.send_malformed_line_telemetry(ctx);
+                        DiffStorageHelper::accept_and_save(diff_view, ctx)
                     });
-                }
-                CodeDiffViewEvent::SavedAcceptedDiffs { .. } => {
                     ctx.notify();
                 }
                 CodeDiffViewEvent::CancelPassive => {
@@ -22661,6 +22691,16 @@ impl TerminalView {
         conversation_id: AIConversationId,
         ctx: &mut ViewContext<Self>,
     ) {
+        // The dialog confirms once, but a second rewind of the conversation may be asked for
+        // while the first is still restoring files.
+        if self
+            .ai_controller
+            .as_ref(ctx)
+            .is_rewind_in_progress(conversation_id)
+        {
+            return;
+        }
+
         // First, cancel any in-progress conversation
         self.ai_controller.update(ctx, |controller, ctx| {
             controller.cancel_conversation_progress(
@@ -22691,15 +22731,20 @@ impl TerminalView {
             self.user_write_ctrl_c_to_pty(ctx);
         }
 
-        // Iterate from end backwards, reverting all diffs in each AIBlock from this conversation until the block the user clicked on (inclusive)
+        // Collect the diffs of each AIBlock from this conversation, from the end backwards until
+        // the block the user clicked on (inclusive), newest first.
         let mut num_blocks_reverted = 0;
+        let mut diff_views = VecDeque::new();
         for rich_content in self.rich_content_views.iter().rev() {
             if let Some(ai_metadata) = rich_content.ai_block_metadata() {
                 // Only revert blocks from the same conversation
                 if ai_metadata.conversation_id == conversation_id {
-                    ai_metadata.ai_block_handle.update(ctx, |block, ctx| {
-                        block.revert_all_diffs(ctx);
-                    });
+                    diff_views.extend(
+                        ai_metadata
+                            .ai_block_handle
+                            .as_ref(ctx)
+                            .diff_views_newest_first(),
+                    );
                     num_blocks_reverted += 1;
                     if ai_metadata.ai_block_handle.id() == ai_block_view_id {
                         break;
@@ -22707,6 +22752,66 @@ impl TerminalView {
                 }
             }
         }
+
+        // The files are restored one diff at a time, and the conversation is truncated only once
+        // all of them are back. Until then no request may be sent for it.
+        self.ai_controller.update(ctx, |controller, _| {
+            controller.set_rewind_in_progress(conversation_id, true);
+        });
+        self.revert_next_diff_for_rewind(
+            PendingRewind {
+                exchange_id,
+                conversation_id,
+                diff_views,
+                num_blocks_reverted,
+            },
+            ctx,
+        );
+    }
+
+    /// Reverts the next diff of a rewind and goes on to the one after it once its files are
+    /// restored: a later diff may build on an earlier one of the same file, so they are never
+    /// restored at the same time. The first failure ends the rewind with the conversation kept.
+    fn revert_next_diff_for_rewind(
+        &mut self,
+        mut rewind: PendingRewind,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(diff_view) = rewind.diff_views.pop_front() else {
+            self.finish_rewind(rewind, ctx);
+            return;
+        };
+        let restore = diff_view.update(ctx, |diff_view, ctx| {
+            diff_view.revert_changes_for_rewind(ctx)
+        });
+        ctx.spawn(restore, move |me, result, ctx| match result {
+            Ok(()) => me.revert_next_diff_for_rewind(rewind, ctx),
+            Err(error) => {
+                log::warn!(
+                    "Rewind of conversation {} stopped, a file edit was not reverted: {error}",
+                    rewind.conversation_id
+                );
+                me.ai_controller.update(ctx, |controller, _| {
+                    controller.set_rewind_in_progress(rewind.conversation_id, false);
+                });
+                // Nothing is truncated: the blocks whose edits are still on disk keep their
+                // revert buttons, and rewinding again picks up where this one stopped.
+                me.show_error_toast(crate::t!("rewind-toast-incomplete"), ctx);
+            }
+        });
+    }
+
+    /// Truncates the conversation once a rewind has restored every file.
+    fn finish_rewind(&mut self, rewind: PendingRewind, ctx: &mut ViewContext<Self>) {
+        let PendingRewind {
+            exchange_id,
+            conversation_id,
+            num_blocks_reverted,
+            ..
+        } = rewind;
+        self.ai_controller.update(ctx, |controller, _| {
+            controller.set_rewind_in_progress(conversation_id, false);
+        });
 
         // Save a backup of the conversation before truncating, so users can restore it later.
         BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {

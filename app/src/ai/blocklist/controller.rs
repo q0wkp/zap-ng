@@ -378,6 +378,9 @@ pub struct BlocklistAIController {
     pending_auto_resume_handles: HashMap<AIConversationId, SpawnedFutureHandle>,
     /// Passive conversations explicitly requested to follow up after actions complete.
     pending_passive_follow_ups: HashSet<AIConversationId>,
+    /// Conversations being rewound: their file edits are being restored and their history is
+    /// about to be truncated, so no request may be sent for them until that is done.
+    rewinds_in_progress: HashSet<AIConversationId>,
     /// Passive suggestion results that should be included with the next request
     /// for a given conversation (e.g. accepted/iterated code diffs that weren't
     /// auto-resumed).
@@ -641,6 +644,7 @@ impl BlocklistAIController {
             byop_requests_awaiting_compaction: HashMap::new(),
             byop_compaction_resends: HashSet::new(),
             byop_auto_compaction_due: HashSet::new(),
+            rewinds_in_progress: HashSet::new(),
         }
     }
 
@@ -3005,6 +3009,13 @@ impl BlocklistAIController {
         is_queued_prompt: bool,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<(AIConversationId, ResponseStreamId)> {
+        // A request sent now would be appended to the history the rewind is about to truncate.
+        anyhow::ensure!(
+            !self.is_rewind_in_progress(request_input.conversation_id),
+            "Conversation {:?} is being rewound",
+            request_input.conversation_id
+        );
+
         let history_model = BlocklistAIHistoryModel::handle(ctx);
         let request_snapshot = self.conversation_snapshot_for_request(&request_input, ctx)?;
         let mut conversation_data = request_snapshot.conversation_data;
@@ -3329,6 +3340,26 @@ impl BlocklistAIController {
         }
 
         Ok((conversation_data.id, response_stream_id))
+    }
+
+    /// Marks `conversation_id` as being rewound, or as done with it. While it is marked, no
+    /// request is sent for the conversation.
+    pub fn set_rewind_in_progress(&mut self, conversation_id: AIConversationId, in_progress: bool) {
+        if in_progress {
+            self.rewinds_in_progress.insert(conversation_id);
+        } else {
+            self.rewinds_in_progress.remove(&conversation_id);
+        }
+    }
+
+    /// Whether `conversation_id` is being rewound.
+    pub fn is_rewind_in_progress(&self, conversation_id: AIConversationId) -> bool {
+        self.rewinds_in_progress.contains(&conversation_id)
+    }
+
+    /// Whether any conversation of this controller is being rewound.
+    pub fn is_any_rewind_in_progress(&self) -> bool {
+        !self.rewinds_in_progress.is_empty()
     }
 
     /// Cancels a pending AI request response stream, given the exchange ID, if it exists.

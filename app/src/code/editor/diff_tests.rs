@@ -11,7 +11,7 @@ use zap_ng_editor::multiline::{MultilineStr, MultilineString};
 
 use crate::code::editor::diff::ChangeType;
 
-use super::DiffModel;
+use super::{compute_unified_diff, DiffModel};
 
 #[test]
 fn test_diff_generation() {
@@ -380,7 +380,7 @@ fn test_diff_count_before_line() {
 fn test_unified_diff() {
     use zap_ng_ui::App;
     App::test((), |_| async move {
-        let diff = DiffModel::retrieve_unified_diff_internal(
+        let diff = compute_unified_diff(
             MultilineStr::try_new("Hello World\nThis is the second line.\nThis is the third.")
                 .unwrap(),
             MultilineStr::try_new(

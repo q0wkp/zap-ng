@@ -110,10 +110,10 @@ fn test_save_uninitialized_file() {
                 ContentVersion::new(),
                 ctx,
             );
-            assert!(result.is_err());
-
-            let e = result.unwrap_err();
-            assert!(matches!(e, FileSaveError::NoFilePath(file_id) if file_id == id));
+            assert!(
+                matches!(result, Err(FileSaveError::NoFilePath(file_id)) if file_id == id),
+                "expected NoFilePath error"
+            );
         });
     });
 }
@@ -357,3 +357,31 @@ fn test_a_failed_open_registers_no_watcher() {
 }
 
 static TEST_FILE_CONTENT: &[u8] = include_bytes!("../test_data/test_file.rs");
+
+#[test]
+fn remote_move_reports_disconnected_host() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(RemoteServerManager::new);
+        let files = app.add_singleton_model(FileModel::new);
+        let file_id = files.update(&mut app, |model, _| {
+            model.register_remote_file(
+                HostId::new("disconnected-host".to_owned()),
+                StandardizedPath::try_new("/repo/source.txt").unwrap(),
+            )
+        });
+        // The host's client is looked up when the move is asked for, as for a save or a delete,
+        // so a host that is not connected fails the call itself: the move is taken as a remote
+        // one, not refused for want of a local path.
+        let result = files.update(&mut app, |model, ctx| {
+            model.rename_and_save(
+                file_id,
+                PathBuf::from("/repo/target.txt"),
+                "updated\n".to_owned(),
+                ContentVersion::new(),
+                ctx,
+            )
+        });
+
+        assert!(matches!(result, Err(FileSaveError::RemoteError(_))));
+    });
+}

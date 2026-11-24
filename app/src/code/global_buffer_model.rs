@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bimap::BiMap;
 
@@ -149,7 +150,7 @@ pub enum GlobalBufferModelEvent {
     },
     FailedToSave {
         file_id: FileId,
-        error: Rc<FileSaveError>,
+        error: Arc<FileSaveError>,
     },
     /// A remote buffer update conflicted with local edits.
     /// The UI should present a resolution dialog.
@@ -682,9 +683,12 @@ impl GlobalBufferModel {
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), FileSaveError> {
-        FileModel::handle(ctx).update(ctx, |file_model, ctx| {
-            file_model.save(file_id, content, version, ctx)
-        })
+        // Completion is observed via `FileModelEvent`s; drop the save future.
+        FileModel::handle(ctx)
+            .update(ctx, |file_model, ctx| {
+                file_model.save(file_id, content, version, ctx)
+            })
+            .map(drop)
     }
 
     /// Rename a file and save its content via FileModel.
@@ -697,9 +701,12 @@ impl GlobalBufferModel {
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), FileSaveError> {
-        FileModel::handle(ctx).update(ctx, |file_model, ctx| {
-            file_model.rename_and_save(file_id, new_path, content, version, ctx)
-        })
+        // Completion is observed via `FileModelEvent`s; drop the save future.
+        FileModel::handle(ctx)
+            .update(ctx, |file_model, ctx| {
+                file_model.rename_and_save(file_id, new_path, content, version, ctx)
+            })
+            .map(drop)
     }
 
     /// Delete a file via FileModel.
@@ -710,9 +717,12 @@ impl GlobalBufferModel {
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), FileSaveError> {
-        FileModel::handle(ctx).update(ctx, |file_model, ctx| {
-            file_model.delete(file_id, version, ctx)
-        })
+        // Completion is observed via `FileModelEvent`s; drop the delete future.
+        FileModel::handle(ctx)
+            .update(ctx, |file_model, ctx| {
+                file_model.delete(file_id, version, ctx)
+            })
+            .map(drop)
     }
 
     /// Remove a tracked buffer, cleaning up FileModel state.
@@ -1392,9 +1402,12 @@ impl GlobalBufferModel {
         let content = buffer.as_ref(ctx).text().into_string();
         // 使用 buffer 当前版本,避免与 daemon 的版本同步错位。
         let version = buffer.as_ref(ctx).version();
-        FileModel::handle(ctx).update(ctx, |file_model, ctx| {
-            file_model.save(file_id, content, version, ctx)
-        })
+        // Completion is observed via `FileModelEvent`s; drop the save future.
+        FileModel::handle(ctx)
+            .update(ctx, |file_model, ctx| {
+                file_model.save(file_id, content, version, ctx)
+            })
+            .map(drop)
     }
 
     /// Resolve a conflict by accepting the client's content.
@@ -1444,9 +1457,12 @@ impl GlobalBufferModel {
         // base_content_version,避免与 daemon 版本同步错位。
         let content = client_content.to_string();
         let save_version = buffer.as_ref(ctx).version();
-        FileModel::handle(ctx).update(ctx, |file_model, ctx| {
-            file_model.save(file_id, content, save_version, ctx)
-        })
+        // Completion is observed via `FileModelEvent`s; drop the save future.
+        FileModel::handle(ctx)
+            .update(ctx, |file_model, ctx| {
+                file_model.save(file_id, content, save_version, ctx)
+            })
+            .map(drop)
     }
 
     // ── Public accessors ──────────────────────────────────────────────
@@ -1508,7 +1524,7 @@ impl GlobalBufferModel {
             // 通知编辑器保存失败,避免停留在虚假的“已保存”状态。
             ctx.emit(GlobalBufferModelEvent::FailedToSave {
                 file_id,
-                error: Rc::new(FileSaveError::RemoteError(format!(
+                error: Arc::new(FileSaveError::RemoteError(format!(
                     "Remote host {host_id:?} is not connected"
                 ))),
             });
@@ -1533,7 +1549,7 @@ impl GlobalBufferModel {
                             // 把远端保存失败上抛给编辑器,显示失败提示。
                             ctx.emit(GlobalBufferModelEvent::FailedToSave {
                                 file_id,
-                                error: Rc::new(FileSaveError::RemoteError(err.message)),
+                                error: Arc::new(FileSaveError::RemoteError(err.message)),
                             });
                         }
                     }
@@ -1542,7 +1558,7 @@ impl GlobalBufferModel {
                     // 传输/协议错误同样上抛给编辑器。
                     ctx.emit(GlobalBufferModelEvent::FailedToSave {
                         file_id,
-                        error: Rc::new(FileSaveError::RemoteError(format!(
+                        error: Arc::new(FileSaveError::RemoteError(format!(
                             "SaveBuffer request failed: {error}"
                         ))),
                     });
